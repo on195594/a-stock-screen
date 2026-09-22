@@ -687,49 +687,327 @@ def fmt_number(value: Any, digits: int = 2) -> str:
     return "—" if number is None else f"{number:.{digits}f}"
 
 
+def annual_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
+    value = row.get("annual_roes")
+    return (
+        [item for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def annual_signature(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(
+        [
+            {
+                "period": item.get("period"),
+                "roe_waa": finite_number(item.get("roe_waa")),
+                "ann_date": item.get("ann_date"),
+                "update_flag": normalize_flag(item.get("update_flag")),
+            }
+            for item in annual_entries(row)
+        ],
+        key=lambda item: str(item["period"]),
+    )
+
+
+def indexed_rows(
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    raw_rows = snapshot.get("rows")
+    if not isinstance(raw_rows, list):
+        return {}, ["rows 不是列表"]
+    rows: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for index, row in enumerate(raw_rows):
+        if not isinstance(row, dict) or not isinstance(row.get("code"), str):
+            warnings.append(f"rows[{index}] 缺少字符串 code")
+            continue
+        code = row["code"]
+        if code in rows:
+            warnings.append(f"rows 含重复代码 {code}")
+            continue
+        rows[code] = row
+    return rows, warnings
+
+
+def missing_signature(row: dict[str, Any]) -> set[str]:
+    reasons = set(row.get("exclusions", []))
+    if finite_number(row.get("pb")) is None:
+        reasons.add("PB_MISSING")
+    if not annual_signature(row):
+        reasons.add("ANNUAL_DATA_MISSING")
+    return reasons
+
+
+def compare_snapshots(
+    previous: dict[str, Any], current: dict[str, Any], previous_path: Path
+) -> dict[str, Any]:
+    incompatibilities: list[str] = []
+    for key in ("anchor", "rule", "formula", "limits"):
+        if previous.get(key) != current.get(key):
+            incompatibilities.append(key)
+    for key in ("industry", "industry_source", "cap", "market_bias"):
+        if previous.get("scope", {}).get(key) != current.get("scope", {}).get(key):
+            incompatibilities.append(f"scope.{key}")
+
+    previous_rows, previous_row_warnings = indexed_rows(previous)
+    current_rows, current_row_warnings = indexed_rows(current)
+    if previous_row_warnings:
+        incompatibilities.append("previous.rows")
+    if current_row_warnings:
+        incompatibilities.append("current.rows")
+    previous_codes = set(previous_rows)
+    current_codes = set(current_rows)
+
+    def identities(
+        codes: set[str], rows: dict[str, dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        return [
+            {"code": code, "name": str(rows.get(code, {}).get("name") or "")}
+            for code in sorted(codes)
+        ]
+
+    scope_entries = identities(current_codes - previous_codes, current_rows)
+    scope_exits = identities(previous_codes - current_codes, previous_rows)
+    compatible = not incompatibilities
+    previous_top = set(previous.get("results", {}).get("top", []))
+    current_top = set(current.get("results", {}).get("top", []))
+    top_entries = (
+        identities(current_top - previous_top, current_rows) if compatible else []
+    )
+    top_exits = (
+        identities(previous_top - current_top, previous_rows) if compatible else []
+    )
+
+    pb_changes: list[dict[str, Any]] = []
+    annual_changes: list[dict[str, Any]] = []
+    newly_missing: list[dict[str, Any]] = []
+    resolved_missing: list[dict[str, Any]] = []
+    for code in sorted(previous_codes & current_codes):
+        before = previous_rows[code]
+        after = current_rows[code]
+        previous_pb = finite_number(before.get("pb"))
+        current_pb = finite_number(after.get("pb"))
+        if (
+            previous_pb is not None
+            and current_pb is not None
+            and previous_pb != current_pb
+        ):
+            pb_changes.append(
+                {
+                    "code": code,
+                    "name": str(after.get("name") or before.get("name") or ""),
+                    "before": previous_pb,
+                    "after": current_pb,
+                    "delta": current_pb - previous_pb,
+                }
+            )
+        previous_annual = annual_signature(before)
+        current_annual = annual_signature(after)
+        if previous_annual and current_annual and previous_annual != current_annual:
+            annual_changes.append(
+                {
+                    "code": code,
+                    "name": str(after.get("name") or before.get("name") or ""),
+                    "before": previous_annual,
+                    "after": current_annual,
+                }
+            )
+
+        previous_missing = missing_signature(before)
+        current_missing = missing_signature(after)
+        for target, reasons in (
+            (newly_missing, current_missing - previous_missing),
+            (resolved_missing, previous_missing - current_missing),
+        ):
+            if reasons:
+                target.append(
+                    {
+                        "code": code,
+                        "name": str(after.get("name") or before.get("name") or ""),
+                        "reasons": sorted(reasons),
+                    }
+                )
+
+    has_changes = any(
+        (
+            incompatibilities,
+            scope_entries,
+            scope_exits,
+            top_entries,
+            top_exits,
+            pb_changes,
+            annual_changes,
+            newly_missing,
+            resolved_missing,
+        )
+    )
+    return {
+        "previous_path": str(previous_path.expanduser().resolve()),
+        "previous_screened_at": previous.get("screened_at"),
+        "previous_data_date": previous.get("data_date"),
+        "compatible_rank": compatible,
+        "incompatibilities": incompatibilities,
+        "scope_entries": scope_entries,
+        "scope_exits": scope_exits,
+        "top_entries": top_entries,
+        "top_exits": top_exits,
+        "pb_changes": pb_changes,
+        "annual_changes": annual_changes,
+        "newly_missing": newly_missing,
+        "resolved_missing": resolved_missing,
+        "member_change_may_affect_rank": bool(scope_entries or scope_exits),
+        "has_changes": has_changes,
+    }
+
+
+def comparison_sections(snapshot: dict[str, Any]) -> list[str]:
+    comparison = snapshot.get("comparison")
+    if not comparison:
+        return []
+    lines = ["## 与指定旧快照相比", ""]
+    lines.append(
+        f"- 对照数据日：{comparison.get('previous_data_date', '—')}；本次数据日：{snapshot.get('data_date', '—')}。"
+    )
+    if comparison.get("incompatibilities"):
+        lines.append(
+            "- 规则/范围不兼容，仅展示原始事实变化，不比较排名："
+            + ", ".join(comparison["incompatibilities"])
+            + "。"
+        )
+    if not comparison.get("has_changes"):
+        lines.append("- 同一输入未发现新变化。")
+        lines.append("")
+        return lines
+
+    for label, key in (("新进入前三", "top_entries"), ("退出前三", "top_exits")):
+        values = comparison.get(key, [])
+        if values:
+            lines.append(
+                f"- {label}："
+                + ", ".join(
+                    f"{item['name'] or '—'} `{item['code']}`" for item in values
+                )
+                + "。"
+            )
+    if comparison.get("member_change_may_affect_rank"):
+        entered = (
+            ", ".join(item["code"] for item in comparison.get("scope_entries", []))
+            or "无"
+        )
+        exited = (
+            ", ".join(item["code"] for item in comparison.get("scope_exits", []))
+            or "无"
+        )
+        lines.append(
+            f"- 同业成员范围变化：进入 {entered}；退出 {exited}。范围变化可能影响排名，不代表公司经营恶化。"
+        )
+    for item in comparison.get("pb_changes", []):
+        lines.append(
+            f"- PB 变化：{item['name'] or '—'} `{item['code']}` {item['before']:.4g} → {item['after']:.4g}"
+            f"（{item['delta']:+.4g}）；这里只记录数值，不归因于股价或基本面。"
+        )
+    for item in comparison.get("annual_changes", []):
+        before = ", ".join(
+            f"{value['period']}:{fmt_number(value['roe_waa'])}%"
+            for value in item["before"]
+        )
+        after = ", ".join(
+            f"{value['period']}:{fmt_number(value['roe_waa'])}%"
+            for value in item["after"]
+        )
+        lines.append(
+            f"- 年报/ROE 变化：{item['name'] or '—'} `{item['code']}` [{before}] → [{after}]。"
+        )
+    for label, key in (
+        ("新增数据缺失", "newly_missing"),
+        ("数据缺失已恢复", "resolved_missing"),
+    ):
+        for item in comparison.get(key, []):
+            lines.append(
+                f"- {label}：{item['name'] or '—'} `{item['code']}`（{', '.join(item['reasons'])}）；不写成公司变差。"
+            )
+    lines.append("")
+    return lines
+
+
 def candidate_review_sections(snapshot: dict[str, Any]) -> list[str]:
-    rows = {row["code"]: row for row in snapshot.get("rows", [])}
-    results = snapshot.get("results") or {}
-    ranks = {item["code"]: item for item in results.get("ranking", [])}
-    anchor = rows.get(snapshot.get("anchor"))
-    anchor_rank = ranks.get(snapshot.get("anchor"))
+    rows, _ = indexed_rows(snapshot)
+    results = snapshot.get("results")
+    results = results if isinstance(results, dict) else {}
+    ranking = results.get("ranking")
+    ranks = (
+        {
+            item["code"]: item
+            for item in ranking
+            if isinstance(item, dict) and isinstance(item.get("code"), str)
+        }
+        if isinstance(ranking, list)
+        else {}
+    )
+    anchor_code = snapshot.get("anchor")
+    anchor = rows.get(anchor_code) if isinstance(anchor_code, str) else None
+    anchor_rank = ranks.get(anchor_code) if isinstance(anchor_code, str) else None
+    top = results.get("top")
     lines = ["", "## 候选审查", ""]
-    for code in results.get("top", []):
-        row = rows[code]
-        rank = ranks[code]
+    for code in top if isinstance(top, list) else []:
+        row = rows.get(code)
+        rank = ranks.get(code)
+        if row is None or rank is None:
+            lines.append(
+                f"- 快照中的候选 `{code}` 缺少对应明细或排名，无法生成审查说明。"
+            )
+            continue
         lines.append(f"### {row.get('name') or '—'} `{code}`")
         lines.append("")
         lines.append(
             f"- 排序原因：三年 ROE 均值 {fmt_number(row.get('roe_mean'))}%（第 {fmt_number(rank.get('roe_rank'), 1)} 名），"
             f"PB {fmt_number(row.get('pb'))}（第 {fmt_number(rank.get('pb_rank'), 1)} 名），综合研究次序第 {rank.get('position')}。"
         )
-        if anchor is not None and anchor_rank is not None:
-            roe_diff = float(row["roe_mean"]) - float(anchor["roe_mean"])
-            pb_diff = float(row["pb"]) - float(anchor["pb"])
-            row_years = [item["period"][:4] for item in row.get("annual_roes", [])]
+        row_roe = finite_number(row.get("roe_mean"))
+        row_pb = finite_number(row.get("pb"))
+        anchor_roe = finite_number(anchor.get("roe_mean")) if anchor else None
+        anchor_pb = finite_number(anchor.get("pb")) if anchor else None
+        if (
+            anchor is not None
+            and anchor_rank is not None
+            and row_roe is not None
+            and row_pb is not None
+            and anchor_roe is not None
+            and anchor_pb is not None
+        ):
+            row_years = [
+                str(item.get("period") or "")[:4] for item in annual_entries(row)
+            ]
             anchor_years = [
-                item["period"][:4] for item in anchor.get("annual_roes", [])
+                str(item.get("period") or "")[:4] for item in annual_entries(anchor)
             ]
             comparison = (
-                f"相对参照公司，ROE 均值差 {roe_diff:+.2f} 个百分点，"
-                f"PB 差 {pb_diff:+.2f} 倍（候选减参照）"
+                f"相对参照公司，ROE 均值差 {row_roe - anchor_roe:+.2f} 个百分点，"
+                f"PB 差 {row_pb - anchor_pb:+.2f} 倍（候选减参照）"
             )
             if row_years != anchor_years:
                 comparison += f"；年报覆盖不同（候选 {row_years}，参照 {anchor_years}）"
             lines.append(f"- 与参照比较：{comparison}。")
         else:
-            lines.append("- 与参照比较：参照公司数据不合格，不计算差值。")
+            lines.append("- 与参照比较：参照或候选数据不完整，不计算差值。")
 
-        annual = sorted(row.get("annual_roes", []), key=lambda item: item["period"])
+        annual = sorted(
+            annual_entries(row), key=lambda item: str(item.get("period") or "")
+        )
+        values = [finite_number(item.get("roe_waa")) for item in annual]
         facts: list[str] = []
-        if any(float(item["roe_waa"]) < 0 for item in annual):
-            facts.append("三年中存在负 ROE")
-        if len(annual) >= 2 and float(annual[-1]["roe_waa"]) < float(
-            annual[-2]["roe_waa"]
-        ):
-            facts.append(
-                f"最新年度 ROE 从 {fmt_number(annual[-2]['roe_waa'])}% 降至 {fmt_number(annual[-1]['roe_waa'])}%"
-            )
+        if len(annual) != 3 or any(value is None for value in values):
+            facts.append("逐年 ROE 数据不足，不能核验负值或最新年度下降")
+        else:
+            numeric = [float(value) for value in values if value is not None]
+            if any(value < 0 for value in numeric):
+                facts.append("三年中存在负 ROE")
+            if numeric[-1] < numeric[-2]:
+                facts.append(
+                    f"最新年度 ROE 从 {fmt_number(numeric[-2])}% 降至 {fmt_number(numeric[-1])}%"
+                )
         lines.append(
             "- 已知事实："
             + (
@@ -747,30 +1025,73 @@ def candidate_review_sections(snapshot: dict[str, Any]) -> list[str]:
 
 
 def render_report(snapshot: dict[str, Any]) -> str:
-    rows = {row["code"]: row for row in snapshot.get("rows", [])}
-    results = snapshot.get("results") or {}
-    ranking = results.get("ranking", [])
-    rank_by_code = {item["code"]: item for item in ranking}
-    top = list(results.get("top", []))
-    anchor = snapshot.get("anchor")
-    shown = top + ([anchor] if anchor and anchor not in top else [])
-    scope = snapshot.get("scope", {})
-    qualified_count = len(ranking)
-    selected_count = len(snapshot.get("rows", []))
-    financial_sources = ", ".join(
-        sorted({str(row.get("financial_source") or "none") for row in rows.values()})
+    rows, row_warnings = indexed_rows(snapshot)
+    results = snapshot.get("results")
+    results = results if isinstance(results, dict) else {}
+    raw_ranking = results.get("ranking")
+    ranking = (
+        [item for item in raw_ranking if isinstance(item, dict)]
+        if isinstance(raw_ranking, list)
+        else []
     )
+    rank_by_code = {
+        item["code"]: item for item in ranking if isinstance(item.get("code"), str)
+    }
+    raw_top = results.get("top")
+    top = (
+        [code for code in raw_top if isinstance(code, str)]
+        if isinstance(raw_top, list)
+        else []
+    )
+    anchor = snapshot.get("anchor")
+    shown = top + ([anchor] if isinstance(anchor, str) and anchor not in top else [])
+    raw_scope = snapshot.get("scope")
+    scope = raw_scope if isinstance(raw_scope, dict) else {}
+    qualified_count = len(ranking)
+    selected_count = len(rows)
+    financial_sources = (
+        ", ".join(
+            sorted(
+                {str(row.get("financial_source") or "none") for row in rows.values()}
+            )
+        )
+        or "none"
+    )
+    annual_coverages = sorted(
+        {
+            "/".join(
+                str(item.get("period") or "")[:4]
+                for item in annual_entries(row)
+                if item.get("period")
+            )
+            for row in rows.values()
+            if annual_entries(row)
+        }
+    )
+    warnings = [
+        *(
+            snapshot.get("replay_warnings", [])
+            if isinstance(snapshot.get("replay_warnings"), list)
+            else []
+        ),
+        *row_warnings,
+    ]
     lines = [
         "# 个人同业选股报告",
         "",
         f"- 参照公司：`{anchor}`",
         f"- 行业：{scope.get('industry', '—')}（TuShare 粗粒度标签）",
         f"- 估值数据日：{snapshot.get('data_date', '—')}；实际筛选时间：{snapshot.get('screened_at', '—')}",
+        f"- 采用年报年份：{'；'.join(annual_coverages) or '—'}",
         f"- 来源：基础信息 `tushare.stock_basic`；估值 `tushare.daily_basic`；财务 {financial_sources}",
         f"- 覆盖：枚举 {scope.get('enumerated_count', 0)} / 截取 {selected_count} / 合格 {qualified_count} / 缺失或排除 {selected_count - qualified_count}",
         f"- 范围限制：最多 {scope.get('cap', CAP)} 家，按同日总市值截取，偏向较大公司；不是完整行业或全市场扫描。",
         "",
     ]
+    if warnings:
+        lines.append("> **快照警告：**" + "；".join(str(item) for item in warnings))
+        lines.append("")
+    lines.extend(comparison_sections(snapshot))
     if results.get("discovery_complete"):
         lines.append(
             f"> 已有 {results.get('outside_watchlist_qualified_count', 0)} 家池外公司以完整数据参与比较。"
@@ -795,8 +1116,8 @@ def render_report(snapshot: dict[str, Any]) -> str:
         rank = rank_by_code.get(code, {})
         annual = (
             " / ".join(
-                f"{item['period'][:4]}:{fmt_number(item['roe_waa'])}%"
-                for item in row.get("annual_roes", [])
+                f"{str(item.get('period') or '')[:4]}:{fmt_number(item.get('roe_waa'))}%"
+                for item in annual_entries(row)
             )
             or "—"
         )
@@ -804,12 +1125,13 @@ def render_report(snapshot: dict[str, Any]) -> str:
         if any(
             finite_number(item.get("roe_waa")) is not None
             and float(item["roe_waa"]) < 0
-            for item in row.get("annual_roes", [])
+            for item in annual_entries(row)
         ):
             checks.append("某年 ROE 为负")
         if row.get("risk_status") != "known_warning":
             checks.append("风险警示/停牌/可交易性待完整核查")
-        checks.extend(row.get("exclusions", []))
+        exclusions = row.get("exclusions")
+        checks.extend(exclusions if isinstance(exclusions, list) else [])
         lines.append(
             f"| {row.get('name') or '—'} `{code}` | {'旧池' if row.get('in_watchlist') else '池外'} | {annual} | "
             f"{fmt_number(row.get('roe_mean'))}% | {fmt_number(row.get('pb'))} | {fmt_number(rank.get('roe_rank'), 1)} | "
@@ -829,9 +1151,15 @@ def render_report(snapshot: dict[str, Any]) -> str:
         ]
     )
     for item in ranking:
-        row = rows[item["code"]]
+        ranking_code = item.get("code")
+        row = rows.get(ranking_code) if isinstance(ranking_code, str) else None
+        if row is None:
+            lines.append(
+                f"| {item.get('position', '—')} | `{ranking_code or '—'}`（快照缺少公司明细） | — | — | {fmt_number(item.get('research_order'), 1)} |"
+            )
+            continue
         lines.append(
-            f"| {item['position']} | {row.get('name') or '—'} `{item['code']}` | {fmt_number(row.get('roe_mean'))}% | "
+            f"| {item.get('position', '—')} | {row.get('name') or '—'} `{ranking_code}` | {fmt_number(row.get('roe_mean'))}% | "
             f"{fmt_number(row.get('pb'))} | {fmt_number(item.get('research_order'), 1)} |"
         )
     if not ranking:
@@ -901,20 +1229,59 @@ def save_output(snapshot: dict[str, Any], output_root: Path) -> Path:
     return directory
 
 
-def replay_snapshot(input_path: Path, output_root: Path) -> Path:
+def load_snapshot(input_path: Path) -> dict[str, Any]:
     try:
         snapshot = json.loads(input_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ScreenError(f"无法读取快照: {exc}") from exc
+    if not isinstance(snapshot, dict):
+        raise ScreenError("快照顶层必须是对象")
     if snapshot.get("schema_version") != SCHEMA_VERSION:
         raise ScreenError(
             f"不支持的 schema_version: {snapshot.get('schema_version')!r}"
         )
+    return snapshot
+
+
+def replay_snapshot(
+    input_path: Path, output_root: Path, compare_path: Path | None = None
+) -> Path:
+    snapshot = load_snapshot(input_path)
+    rows, replay_warnings = indexed_rows(snapshot)
+    rank_fields = {"exclusions", "annual_roes", "pb", "roe_mean"}
+
+    def supports_ranking(row: dict[str, Any]) -> bool:
+        if not rank_fields <= row.keys() or not isinstance(row["exclusions"], list):
+            return False
+        if row["exclusions"]:
+            return True
+        annual = annual_entries(row)
+        return (
+            len(annual) == 3
+            and all(finite_number(item.get("roe_waa")) is not None for item in annual)
+            and finite_number(row["pb"]) is not None
+            and finite_number(row["roe_mean"]) is not None
+        )
+
+    rank_fields_missing = any(not supports_ranking(row) for row in rows.values())
     if snapshot.get("rule") == RULE and not snapshot.get("results"):
-        snapshot["results"] = rank_peers(
-            snapshot.get("rows", []),
-            snapshot.get("anchor", ""),
-            snapshot.get("watchlist_codes", []),
+        if replay_warnings or rank_fields_missing:
+            replay_warnings.append("字段不足，未按当前规则重算排名")
+        else:
+            try:
+                watchlist_codes = snapshot.get("watchlist_codes")
+                snapshot["results"] = rank_peers(
+                    list(rows.values()),
+                    str(snapshot.get("anchor") or ""),
+                    watchlist_codes if isinstance(watchlist_codes, list) else [],
+                )
+            except (KeyError, TypeError, ValueError, ScreenError):
+                replay_warnings.append("字段不足，未按当前规则重算排名")
+    if replay_warnings:
+        snapshot["replay_warnings"] = replay_warnings
+    if compare_path:
+        snapshot["comparison"] = compare_snapshots(
+            load_snapshot(compare_path), snapshot, compare_path
         )
     snapshot["generated_at"] = now_iso()
     snapshot["replayed_from"] = str(input_path.resolve())
@@ -928,6 +1295,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--date")
     result.add_argument("--refresh", action="store_true")
     result.add_argument("--input", type=Path)
+    result.add_argument("--compare", type=Path)
     return result
 
 
@@ -940,7 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ScreenError(
                     "--input 与 --anchor/--date/--refresh/--tracker-root 互斥"
                 )
-            directory = replay_snapshot(args.input, output_root)
+            directory = replay_snapshot(args.input, output_root, args.compare)
         else:
             if not args.anchor:
                 raise ScreenError("参照模式必须提供 --anchor")
@@ -948,10 +1316,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise ScreenError(
                     "当前没有完整本地同业清单；请显式使用 --refresh 或用 --input 复看快照"
                 )
+            previous = load_snapshot(args.compare) if args.compare else None
             tracker_root = args.tracker_root or (
                 Path(__file__).resolve().parent.parent / "a-stock-tracker"
             )
             snapshot = build_live_snapshot(tracker_root, args.anchor, args.date)
+            if previous is not None:
+                snapshot["comparison"] = compare_snapshots(
+                    previous, snapshot, args.compare
+                )
             directory = save_output(snapshot, output_root)
         print(directory)
         return 0

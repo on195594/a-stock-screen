@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from copy import deepcopy
 from pathlib import Path
 
 import screen
@@ -204,7 +205,9 @@ def test_replay_is_offline_and_does_not_overwrite_input(tmp_path: Path) -> None:
     original = json.dumps(snapshot, ensure_ascii=False)
     input_path.write_text(original, encoding="utf-8")
 
-    output = screen.replay_snapshot(input_path, tmp_path / "output")
+    previous_path = tmp_path / "previous.json"
+    previous_path.write_text(original, encoding="utf-8")
+    output = screen.replay_snapshot(input_path, tmp_path / "output", previous_path)
 
     assert input_path.read_text(encoding="utf-8") == original
     assert (output / "snapshot.json").is_file()
@@ -213,6 +216,64 @@ def test_replay_is_offline_and_does_not_overwrite_input(tmp_path: Path) -> None:
     assert replayed["screened_at"] == snapshot["screened_at"]
     assert replayed["data_date"] == snapshot["data_date"]
     assert replayed["replayed_from"] == str(input_path.resolve())
+    assert replayed["comparison"]["has_changes"] is False
+
+
+def test_incomplete_snapshot_replays_without_fabricating_results(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "incomplete.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rule": screen.RULE,
+                "anchor": "600001.SH",
+                "rows": [
+                    {
+                        "code": "600001.SH",
+                        "name": "候选",
+                        "pb": 1.0,
+                        "roe_mean": 10.0,
+                        "annual_roes": [],
+                        "exclusions": [],
+                    }
+                ],
+                "results": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = screen.replay_snapshot(input_path, tmp_path / "output")
+    replayed = json.loads((output / "snapshot.json").read_text(encoding="utf-8"))
+    report = (output / "report.md").read_text(encoding="utf-8")
+
+    assert replayed["results"] == {}
+    assert replayed["replay_warnings"] == ["字段不足，未按当前规则重算排名"]
+    assert "快照警告" in report
+    assert "采用年报年份：—" in report
+
+    review = screen.candidate_review_sections(
+        {
+            "anchor": "600001.SH",
+            "rows": [
+                {
+                    "code": "600001.SH",
+                    "name": "候选",
+                    "roe_mean": None,
+                    "pb": None,
+                    "annual_roes": [],
+                }
+            ],
+            "results": {
+                "top": ["600001.SH"],
+                "ranking": [{"code": "600001.SH", "position": 1}],
+            },
+        }
+    )
+    assert "逐年 ROE 数据不足" in "\n".join(review)
+    assert "未触发负 ROE" not in "\n".join(review)
 
 
 def test_report_contains_candidate_review_without_investment_claims() -> None:
@@ -261,8 +322,98 @@ def test_report_contains_candidate_review_without_investment_claims() -> None:
 
     report = screen.render_report(snapshot)
 
+    assert "采用年报年份：2023/2024/2025" in report
     assert "## 候选审查" in report
     assert "ROE 均值差 -3.00 个百分点" in report
     assert "PB 差 -2.00 倍（候选减参照）" in report
     assert "最新年度 ROE 从 11.00% 降至 10.00%" in report
     assert "不是买入建议" in report
+
+
+def test_compare_classifies_member_change_without_calling_it_deterioration(
+    tmp_path: Path,
+) -> None:
+    annual = [
+        {
+            "period": "2023-12-31",
+            "roe_waa": 8,
+            "ann_date": "2024-03-01",
+            "update_flag": "0",
+        },
+        {
+            "period": "2024-12-31",
+            "roe_waa": 9,
+            "ann_date": "2025-03-01",
+            "update_flag": "0",
+        },
+        {
+            "period": "2025-12-31",
+            "roe_waa": 10,
+            "ann_date": "2026-03-01",
+            "update_flag": "0",
+        },
+    ]
+
+    def row(code: str, name: str, pb: float) -> dict:
+        return {
+            "code": code,
+            "name": name,
+            "pb": pb,
+            "annual_roes": annual,
+            "exclusions": [],
+        }
+
+    common = {
+        "schema_version": 1,
+        "rule": screen.RULE,
+        "formula": "same",
+        "limits": {"cap": 50},
+        "anchor": "600900.SH",
+        "scope": {
+            "industry": "水力发电",
+            "industry_source": "tushare.stock_basic",
+            "cap": 50,
+            "market_bias": "same",
+        },
+        "screened_at": "2026-09-22T20:00:00+08:00",
+        "data_date": "2026-09-22",
+    }
+    previous = {
+        **common,
+        "rows": [row("600900.SH", "参照", 3), row("600001.SH", "旧成员", 1)],
+        "results": {"top": ["600001.SH", "600900.SH"]},
+    }
+    current = {
+        **common,
+        "rows": [row("600900.SH", "参照", 3), row("600002.SH", "新成员", 1)],
+        "results": {"top": ["600002.SH", "600900.SH"]},
+    }
+
+    comparison = screen.compare_snapshots(previous, current, tmp_path / "previous.json")
+    current["comparison"] = comparison
+    text = "\n".join(screen.comparison_sections(current))
+
+    assert comparison["scope_exits"] == [{"code": "600001.SH", "name": "旧成员"}]
+    assert comparison["scope_entries"] == [{"code": "600002.SH", "name": "新成员"}]
+    assert comparison["newly_missing"] == []
+    assert comparison["resolved_missing"] == []
+    assert "范围变化可能影响排名，不代表公司经营恶化" in text
+
+    unchanged = screen.compare_snapshots(previous, previous, tmp_path / "same.json")
+    assert unchanged["has_changes"] is False
+
+    missing = deepcopy(previous)
+    missing["rows"][1]["pb"] = None
+    missing["rows"][1]["annual_roes"] = []
+    changed = screen.compare_snapshots(
+        previous, missing, tmp_path / "before-missing.json"
+    )
+    assert changed["newly_missing"] == [
+        {
+            "code": "600001.SH",
+            "name": "旧成员",
+            "reasons": ["ANNUAL_DATA_MISSING", "PB_MISSING"],
+        }
+    ]
+    recovered = screen.compare_snapshots(missing, previous, tmp_path / "recovered.json")
+    assert recovered["resolved_missing"] == changed["newly_missing"]
