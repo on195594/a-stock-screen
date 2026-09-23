@@ -276,6 +276,34 @@ def test_incomplete_snapshot_replays_without_fabricating_results(
     assert "未触发负 ROE" not in "\n".join(review)
 
 
+def test_unsupported_rule_replays_without_recalculation(tmp_path: Path) -> None:
+    input_path = tmp_path / "legacy.json"
+    legacy_results = {"top": [], "ranking": [], "legacy_marker": True}
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rule": "peer-screen-v0",
+                "anchor": "600001.SH",
+                "scope": {},
+                "rows": [],
+                "results": legacy_results,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = screen.replay_snapshot(input_path, tmp_path / "output")
+    replayed = json.loads((output / "snapshot.json").read_text(encoding="utf-8"))
+    report = (output / "report.md").read_text(encoding="utf-8")
+
+    assert replayed["results"] == legacy_results
+    assert replayed["replay_warnings"] == [
+        "规则 peer-screen-v0 不受当前版本支持，保留原结果且未重算排名"
+    ]
+    assert "快照警告" in report
+
+
 def test_report_contains_candidate_review_without_investment_claims() -> None:
     annual_anchor = [
         {"period": "2023-12-31", "roe_waa": 13},

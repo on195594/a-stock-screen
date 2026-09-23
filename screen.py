@@ -1264,7 +1264,11 @@ def replay_snapshot(
         )
 
     rank_fields_missing = any(not supports_ranking(row) for row in rows.values())
-    if snapshot.get("rule") == RULE and not snapshot.get("results"):
+    if snapshot.get("rule") != RULE:
+        replay_warnings.append(
+            f"规则 {snapshot.get('rule')} 不受当前版本支持，保留原结果且未重算排名"
+        )
+    elif not snapshot.get("results"):
         if replay_warnings or rank_fields_missing:
             replay_warnings.append("字段不足，未按当前规则重算排名")
         else:
