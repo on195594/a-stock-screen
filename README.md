@@ -1,13 +1,13 @@
 # a-stock-screen
 
-个人同业研究工具：`screen.py` 用当前 TuShare 基础信息、同日 PB 与连续三年 `roe_waa` 安排研究顺序；Flet Web 工作台用于离线浏览快照和保存个人研究记录。不是买入建议、收益模型或 Framework A 的延续。设计与实施边界见 [文档导航](docs/README.md)、[Flet 设计](docs/FLET_DESIGN.md)和[实施切片](docs/CODEX_IMPLEMENTATION.md)。
+个人同业研究工具：`screen.py` 用当前 TuShare 基础信息、同日 PB 与连续三年 `roe_waa` 安排研究顺序；Flet Web 工作台用于查看快照、提交同业扫描和保存个人研究记录。不是买入建议、收益模型或 Framework A 的延续。设计与实施边界见 [文档导航](docs/README.md)、[Flet 设计](docs/FLET_DESIGN.md)和[实施切片](docs/CODEX_IMPLEMENTATION.md)。
 
-## Web 工作台命令 (S1)
+## Web 工作台命令
 
 | 项目命令 | 说明 |
 |---|---|
 | `make setup` | 用冻结锁文件安装独立环境依赖（需预先安装 `uv`） |
-| `make demo` | 幂等初始化演示工作区并导入合成 fixture，启动动态 Web（默认 127.0.0.1:8550） |
+| `make demo` | 幂等初始化演示工作区并导入合成 fixture，启动动态 Web 与独立合成 worker（默认 127.0.0.1:8550） |
 | `make check` | 执行离线单元/服务/安全测试及格式、lint、类型检查（不含浏览器测试） |
 | `make test-mobile` | 启动隔离临时 demo 执行移动端浏览器（390px）端到端自动化测试 |
 
@@ -16,11 +16,11 @@
 > uv run python3 -m playwright install chromium
 > ```
 
-当前 S1 页面**不提供联网更新**：更新按钮禁用，S2 独立 worker 尚未实现；已有的离线变化/已阅逻辑不等于 S3 或真机验收。公网匿名登录页已在浏览器打开，生产 GitHub OAuth 和移动真机行为仍须实际验证。首页对同一次请求的已核验快照仅保留关注标的所需数据，下次请求重新核验；这不消除 Flet Web 首次加载运行时的耗时。工作区本地数据位于 `.local/`（demo）或配置的 `STATE_DIR`，不属于可清理的临时文件。
+**同业自动更新（按本人点击）**：登录后到“同业发现”，选择原关注清单里的参照公司，点击“查找同业”。Web 只登记任务，独立 worker 按已证明的上一交易日取 TuShare 数据（财务资料不以旧原始缓存冒充本次核查）、生成并核验快照；任务页显示真实状态，关闭页面后仍会继续，首页“最近同业更新”可找回任务。demo 使用合成 fixture，绝不连接 TuShare。不会定时选股；“关注资料更新”按钮仍未实现，旧的同业名次与个人备注不被任务覆盖。日历若尚未证明到昨日本次请求会拒绝，不会猜日期或静默使用旧日。公网匿名登录页已在浏览器打开；生产本人 GitHub OAuth、真机和真实 TuShare 更新仍须实际验证。工作区本地数据位于 `.local/`（demo）或 `STATE_DIR`，不是可清理的临时文件。
 
 ## VPS 部署（仅在本机执行）
 
-此 VPS 使用 Docker Compose 运行 Web，`/home/lin/nginx` 中的 Docker Nginx 作 HTTPS/WSS 代理；应用当前只有 Web 容器，没有更新 worker。生产 Compose 未设置 `FLET_WEB_NO_CDN`，浏览器首屏仍可能请求外部公共 CDN；demo 则使用本地资源。代码更新后在本机运行 `./deploy.sh`：脚本从自身所在目录读取 `.env`，不拉取代码；先执行 `make check`，再构建并重建 Web 容器。站点配置有变化时备份到 `/home/lin/nginx/sites-enabled/stock.conf.bak.*`，经 `nginx -t` 通过才继续；最后平滑重载 Nginx，并检查回环地址的 Web 与 HTTPS 首页。构建或代理配置预检失败不会替换运行中的 Web 容器；重建后的健康检查失败会非零退出，**不会自动回滚 Web 镜像**，须人工检查。仅支持此 VPS 布局，需预先运行一次 `make setup` 并确保有 Docker 权限；不能在 demo 环境执行。提交 Git 不会自动部署；不要将 `.env` 或工作区数据提交到 Git。
+此 VPS 当前运行的是**上一版 Web**，本次新增 worker/参照选择尚未部署。仓库的 Docker Compose 已定义 Web + 独立 worker；Docker Nginx 位于 `/home/lin/nginx`。生产部署前，本人须将 `.worker.env.example` 复制为仅本机使用的 `.worker.env`，填入 `TUSHARE_TOKEN`（不要将它交给 Web，也不要提交 Git）；已存在的 `.env` 仅供 Web 认证。Compose 只读挂载 tracker 的关注清单、已证明日历和原库；原库不被修改。先核对 `data/` 是 production 工作区、日历覆盖昨日和只读源路径可访问，再经明确授权在本机运行 `./deploy.sh`。脚本预检、`make check`、构建重建 Web、校验/平滑重载 Nginx、回环 HTTPS 检查，最后启动并检查 worker；失败非零退出，**不自动回滚已重建的 Web**。生产 Compose 仍可能加载公共 CDN；demo 使用本地资源。仅支持此 VPS 布局，需 Docker 权限和独立环境；不要在 demo 环境执行部署。提交 Git 不会自动部署；`.env`、`.worker.env`、工作区均不得提交。
 
 ## CLI 历史脚本使用
 

@@ -1,5 +1,6 @@
 services:
   web:
+    image: a-stock-screen-web
     build:
       context: .
       dockerfile: Dockerfile
@@ -11,8 +12,11 @@ services:
       - "127.0.0.1:8550:8550"
     volumes:
       - ./data:/app/data
+      - /home/lin/a-stock-tracker/a_stock_tracker/config.py:/tracker/a_stock_tracker/config.py:ro
+      - /home/lin/a-stock-tracker/data/trading_calendar.json:/tracker/data/trading_calendar.json:ro
     environment:
       - APP_MODE=production
+      - TRACKER_ROOT=/tracker
       - STATE_DIR=/app/data
       - PUBLIC_BASE_URL=https://stock.keyi.win
       - HOST=0.0.0.0
@@ -24,6 +28,18 @@ services:
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
       - GITHUB_ALLOWED_USER_ID=${GITHUB_ALLOWED_USER_ID}
+  worker:
+    image: a-stock-screen-web
+    container_name: a-stock-screen-worker
+    restart: unless-stopped
+    stop_grace_period: 2m
+    env_file: .worker.env
+    command: ["python", "worker.py", "--mode", "production", "--state-dir", "/app/data", "--tracker-root", "/tracker"]
+    volumes:
+      - ./data:/app/data
+      - /home/lin/a-stock-tracker/a_stock_tracker/config.py:/tracker/a_stock_tracker/config.py:ro
+      - /home/lin/a-stock-tracker/data/trading_calendar.json:/tracker/data/trading_calendar.json:ro
+      - /home/lin/a-stock-tracker/tracker.db:/tracker/tracker.db:ro
 
 networks:
   nginx-network:

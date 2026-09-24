@@ -3,7 +3,7 @@
 > 设计版本：1.0 · 2026-09-23
 > 适用项目：`on195594/a-stock-screen`；核对基线 `9cfd9a2f09dea94f3d4cb11f0e7e7f726c2f0090`。
 > 使用者：所有者本人；主要终端：Web端，兼容移动端浏览器；部署：一台 Linux VPS。
-> 本文是目标设计，不是已完成的软件或生产验收；当前实施范围与限制见 [文档导航](README.md)。配套执行顺序见 [CODEX_IMPLEMENTATION.md](CODEX_IMPLEMENTATION.md)。原拟 Caddy/systemd 与独立 worker 尚非本机现状：当前部署为 Docker Compose + Nginx 的 Web 容器，worker 未实现；demo 配置了 `FLET_WEB_NO_CDN=true`，生产 Compose 尚未配置。
+> 本文是目标设计，不是已完成的软件或生产验收；当前实施范围与限制见 [文档导航](README.md)。配套执行顺序见 [CODEX_IMPLEMENTATION.md](CODEX_IMPLEMENTATION.md)。原拟 Caddy/systemd 不是本机现状：当前已部署 Docker Compose + Nginx Web；本工作区已实现同业任务 worker 与 Compose 定义，但尚未部署或验收生产数据链路，watch 更新仍未实现。demo 配置了 `FLET_WEB_NO_CDN=true`，生产 Compose 尚未配置。
 
 ## 渐进式设计导引（Progressive Disclosure）
 

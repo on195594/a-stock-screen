@@ -7,12 +7,14 @@ import json
 import logging
 import sqlite3
 import urllib.parse
-from datetime import date
+import uuid
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from auth import Actor, check_actor
-from screen import normalize_flag
+from screen import ScreenError, normalize_flag, read_watchlist
 from workspace import (
     Mode,
     WorkspaceError,
@@ -26,6 +28,7 @@ from workspace import (
     list_watch_items,
     mark_watch_ack,
     save_watch_item,
+    utc_now,
     watch_run_targets,
 )
 
@@ -750,5 +753,181 @@ def get_peer_discover(
             },
             "rows": safe_rows(snap),
         }
+    finally:
+        conn.close()
+
+
+def peer_anchors(actor: Actor, tracker_root: Path | None, mode: Mode) -> list[dict[str, str]]:
+    """Only offer original watched anchors; demo never reads the tracker."""
+    check_actor(actor)
+    if mode == "demo":
+        return [{"code": "600001.SH", "name": "合成参照"}]
+    if tracker_root is None:
+        raise ServiceError("未配置只读参照目录")
+    try:
+        anchors = read_watchlist(tracker_root / "a_stock_tracker" / "config.py")
+    except (ScreenError, OSError) as exc:
+        raise ServiceError("原关注清单不可读取") from exc
+    check_actor(actor)
+    return [{"code": item["ts_code"], "name": item["name"]} for item in anchors]
+
+
+def _peer_target_date(tracker_root: Path | None, mode: Mode) -> str:
+    if mode == "demo":
+        return "2026-09-20"  # Explicit synthetic fixture date, never a live observation.
+    if tracker_root is None:
+        raise ServiceError("未配置交易日历")
+    try:
+        calendar = json.loads(
+            (tracker_root / "data" / "trading_calendar.json").read_text(encoding="utf-8")
+        )
+        yesterday = datetime.now(ZoneInfo("Asia/Shanghai")).date() - timedelta(days=1)
+        start = date.fromisoformat(calendar["covered_from"])
+        end = date.fromisoformat(calendar["covered_to"])
+        as_of = date.fromisoformat(calendar["as_of"])
+        if (
+            not str(calendar.get("source", "")).startswith("tushare.trade_cal:SSE;")
+            or start > yesterday
+            or end < yesterday
+            or as_of < yesterday
+        ):
+            raise ValueError("calendar coverage is stale")
+        trading_days = [date.fromisoformat(day) for day in calendar["dates"]]
+        if not trading_days or any(day < start or day > min(end, as_of) for day in trading_days):
+            raise ValueError("calendar dates exceed proved coverage")
+        completed = [day for day in trading_days if day <= yesterday]
+        if not completed:
+            raise ValueError("no completed trade day")
+        return max(completed).isoformat()
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ServiceError("交易日历缺失或未覆盖昨日；旧资料仍可查看，本次不提交更新") from exc
+
+
+def _job_summary(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    payload = json.loads(row["payload_json"])
+    return {
+        "job_id": row["job_id"],
+        "kind": row["kind"],
+        "anchor": payload.get("anchor"),
+        "target_date": payload.get("target_date"),
+        "status": row["status"],
+        "phase": row["phase"],
+        "requested_at": row["requested_at"],
+        "updated_at": row["updated_at"],
+        "finished_at": row["finished_at"],
+        "error_summary": row["error_summary"],
+        "result_run_id": row["result_run_id"],
+    }
+
+
+def request_peer_update(
+    actor: Actor,
+    anchor: str,
+    request_id: str,
+    state_dir: Path,
+    mode: Mode,
+    tracker_root: Path | None = None,
+) -> dict[str, Any]:
+    """Freeze a user-clicked peer scan. Network access belongs only to worker.py."""
+    check_actor(actor)
+    if (
+        not request_id
+        or len(request_id) > 100
+        or not all(c.isascii() and (c.isalnum() or c in "_-") for c in request_id)
+    ):
+        raise ServiceError("无效请求编号")
+    intent = {"kind": "peer", "anchor": anchor}
+    try:
+        conn = connect_workspace(state_dir, mode)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """SELECT * FROM update_jobs WHERE request_id=? OR EXISTS
+                (SELECT 1 FROM json_each(update_jobs.request_aliases_json) WHERE value=?)""",
+                (request_id, request_id),
+            ).fetchone()
+            if existing:
+                if json.loads(existing["payload_json"]).get("intent") != intent:
+                    raise ServiceError("请求编号对应不同更新意图")
+                check_actor(actor)
+                conn.commit()
+                return _job_summary(existing)
+
+            watchlist = peer_anchors(actor, tracker_root, mode)
+            if anchor not in {item["code"] for item in watchlist}:
+                raise ServiceError("参照公司不在允许范围内")
+            target_date = _peer_target_date(tracker_root, mode)
+            payload: dict[str, Any] = {
+                "intent": intent,
+                "anchor": anchor,
+                "target_date": target_date,
+                "rule_id": "peer-screen-v1",
+                "watchlist": watchlist,
+            }
+            dedupe_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            payload["intent_hash"] = dedupe_key
+            active = conn.execute(
+                "SELECT * FROM update_jobs WHERE dedupe_key=? AND status IN ('queued','running')",
+                (dedupe_key,),
+            ).fetchone()
+            if active:
+                aliases = json.loads(active["request_aliases_json"])
+                aliases.append(request_id)
+                conn.execute(
+                    "UPDATE update_jobs SET request_aliases_json=? WHERE job_id=?",
+                    (json.dumps(aliases), active["job_id"]),
+                )
+                check_actor(actor)
+                conn.commit()
+                return _job_summary(active)
+            if (
+                conn.execute("SELECT count(*) FROM update_jobs WHERE status='queued'").fetchone()[0]
+                >= 3
+            ):
+                raise ServiceError("待处理任务已满，请稍后再试")
+            now = utc_now()
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                """INSERT INTO update_jobs
+                (job_id,request_id,kind,payload_json,dedupe_key,status,requested_at,updated_at)
+                VALUES (?,?,?,?,?,'queued',?,?)""",
+                (job_id, request_id, "peer", json.dumps(payload), dedupe_key, now, now),
+            )
+            check_actor(actor)
+            conn.commit()
+            row = conn.execute("SELECT * FROM update_jobs WHERE job_id=?", (job_id,)).fetchone()
+            return _job_summary(row)
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+    except WorkspaceError as exc:
+        raise ServiceError(str(exc)) from exc
+
+
+def list_update_jobs(actor: Actor, state_dir: Path, mode: Mode) -> list[dict[str, Any]]:
+    check_actor(actor)
+    conn = connect_workspace(state_dir, mode)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM update_jobs ORDER BY requested_at DESC LIMIT 20"
+        ).fetchall()
+        check_actor(actor)
+        return [_job_summary(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_update_job(actor: Actor, job_id: str, state_dir: Path, mode: Mode) -> dict[str, Any]:
+    check_actor(actor)
+    conn = connect_workspace(state_dir, mode)
+    try:
+        row = conn.execute("SELECT * FROM update_jobs WHERE job_id=?", (job_id,)).fetchone()
+        check_actor(actor)
+        if row is None:
+            raise ServiceError("更新任务不存在")
+        return _job_summary(row)
     finally:
         conn.close()

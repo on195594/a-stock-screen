@@ -1006,12 +1006,12 @@ def test_discover_damaged_snapshot_shows_fallback_then_error(tmp_path, monkeypat
         page.navigation_bar.selected_index = 1
         await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
         disc = page.controls[0].controls[0].controls[0].content.controls[1].content
-        assert "最新同业运行 (latest) 快照损坏" in disc.controls[3].content.value
-        assert disc.controls[4].controls  # history ranking remains visible
+        assert "最新同业运行 (latest) 快照损坏" in disc.controls[5].content.value
+        assert disc.controls[6].controls  # history ranking remains visible
         old_path.unlink()
         await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
         disc = page.controls[0].controls[0].controls[0].content.controls[1].content
-        assert disc.controls[3].content.value == "最新同业快照损坏或无法读取"
-        assert disc.controls[4].controls == []
+        assert disc.controls[5].content.value == "最新同业快照损坏或无法读取"
+        assert disc.controls[6].controls == []
 
     asyncio.run(check())

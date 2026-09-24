@@ -116,7 +116,13 @@ def read_watchlist(config_path: Path) -> list[dict[str, str]]:
     for item in raw:
         if not isinstance(item, dict) or not isinstance(item.get("code"), str):
             raise ScreenError("WATCHLIST 条目缺少字符串 code")
-        result.append({"code": base_code(item["code"]), "name": str(item.get("name") or "")})
+        result.append(
+            {
+                "code": base_code(item["code"]),
+                "ts_code": normalize_code(item["code"]),
+                "name": str(item.get("name") or ""),
+            }
+        )
     return result
 
 
@@ -135,9 +141,15 @@ def read_cached_reference(db_path: Path, code: str) -> dict[str, Any] | None:
     return {"name": row[0], "industry": row[1], "updated_at": row[2]} if row else None
 
 
-def load_reference(tracker_root: Path, anchor: str) -> dict[str, Any]:
+def load_reference(
+    tracker_root: Path, anchor: str, watchlist_override: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
     tracker_root = tracker_root.expanduser().resolve()
-    watchlist = read_watchlist(tracker_root / "a_stock_tracker" / "config.py")
+    watchlist = (
+        read_watchlist(tracker_root / "a_stock_tracker" / "config.py")
+        if watchlist_override is None
+        else watchlist_override
+    )
     anchor_code = normalize_code(anchor)
     watchlist_codes = [item["code"] for item in watchlist]
     if base_code(anchor_code) not in watchlist_codes:
@@ -450,6 +462,8 @@ def fetch_financials(
     )
     if len(records) >= 100:
         raise ScreenError(f"{code} fina_indicator 疑似达到 100 行截断上限")
+    if len({json.dumps(row, sort_keys=True) for row in records}) != len(records):
+        raise ScreenError(f"{code} fina_indicator 返回重复记录")
     acquired_at = now_iso()
     requested_code = normalize_code(code)
     for row in records:
@@ -469,6 +483,7 @@ def load_inputs(
     client: Any,
     token: str,
     source_times: dict[str, str],
+    refresh_financials: bool = False,
 ) -> tuple[list[dict[str, Any]], str]:
     rows: list[dict[str, Any]] = []
     screened_at = now_iso()
@@ -492,8 +507,10 @@ def load_inputs(
             "error": "NOT_FETCHED",
         }
         financial_source = "none"
+        financial_checked_at: str | None = None
         if not exclusions or (pb is not None and pb <= 0):
-            local_records = read_local_financials(raw_db, code)
+            # Old raw observations carry acquisition time, not proof of a recent check.
+            local_records = [] if refresh_financials else read_local_financials(raw_db, code)
             local_selection = select_annual_roes(local_records, data_date, screened_at)
             if local_selection["error"] is None:
                 financial = local_selection
@@ -505,8 +522,14 @@ def load_inputs(
                     online_records = fetch_financials(client, token, code, data_date, screened_at)
                     financial = select_annual_roes(online_records, data_date, screened_at)
                     financial_source = "tushare.fina_indicator"
+                    if refresh_financials and financial["error"] is None:
+                        financial_checked_at = now_iso()
                 except ScreenError as exc:
-                    financial = {"annual_roes": [], "roe_mean": None, "error": str(exc)}
+                    financial = {
+                        "annual_roes": [],
+                        "roe_mean": None,
+                        "error": "FINANCIAL_REQUEST_FAILED" if refresh_financials else str(exc),
+                    }
                     financial_source = "tushare.fina_indicator:error"
         if financial["error"]:
             exclusions.append(str(financial["error"]))
@@ -532,6 +555,7 @@ def load_inputs(
                 "annual_roes": financial["annual_roes"],
                 "roe_mean": roe_mean,
                 "financial_source": financial_source,
+                **({"financial_checked_at": financial_checked_at} if refresh_financials else {}),
                 "risk_status": status,
                 "risk_source": "tushare.stock_basic.name",
                 "exclusions": sorted(set(exclusions)),
@@ -611,10 +635,14 @@ def default_data_date(tracker_root: Path) -> str:
 
 
 def build_live_snapshot(
-    tracker_root: Path, anchor: str, requested_date: str | None
+    tracker_root: Path,
+    anchor: str,
+    requested_date: str | None,
+    watchlist_override: list[dict[str, str]] | None = None,
+    refresh_financials: bool = False,
 ) -> dict[str, Any]:
     tracker_root = tracker_root.expanduser().resolve()
-    reference = load_reference(tracker_root, anchor)
+    reference = load_reference(tracker_root, anchor, watchlist_override)
     data_date = iso_date(requested_date) if requested_date else default_data_date(tracker_root)
     token = read_token(tracker_root)
     try:
@@ -635,9 +663,12 @@ def build_live_snapshot(
         client,
         token,
         source_times,
+        refresh_financials,
     )
     results = rank_peers(rows, reference["anchor"], reference["watchlist_codes"])
     generated_at = now_iso()
+    if refresh_financials:
+        screened_at = generated_at  # Worker capture follows the last checked acquisition.
     scope.update(source_times)
     scope["valuation_date"] = data_date
     scope["source"] = "tracker"

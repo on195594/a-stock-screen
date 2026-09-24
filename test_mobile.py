@@ -83,6 +83,12 @@ def main() -> int:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    worker_proc = subprocess.Popen(
+        [sys.executable, "worker.py", "--mode", "demo", "--state-dir", str(state_dir)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     try:
         base_url = f"http://127.0.0.1:{port}"
@@ -157,7 +163,11 @@ def main() -> int:
                 discover_nav = page.locator("[aria-label='同业发现']").first
                 discover_nav.click()
                 page.wait_for_selector("text=参照标的", timeout=10000)
-                time.sleep(1)
+                assert click_semantics_button("查找同业"), "Could not submit peer update"
+                page.wait_for_selector("text=更新任务", timeout=10000)
+                page.wait_for_selector("text=状态：succeeded / complete", timeout=20000)
+                assert click_semantics_button("返回同业发现"), "Could not return to discovery"
+                page.wait_for_selector("text=参照标的", timeout=10000)
 
                 # 3. Click "查看" for company 600001.SH (index 1 in the list)
                 company_btn = page.locator("flt-semantics[role='button']:has-text('查看')").nth(1)
@@ -259,7 +269,7 @@ def main() -> int:
                 assert val == test_reason, f"Expected reason '{test_reason}', got '{val}'"
 
                 print(
-                    "Mobile browser end-to-end test passed: discover -> view -> edit -> save -> DB check -> reload -> home check confirmed."
+                    "Mobile browser end-to-end test passed: submit -> worker complete -> discover -> edit -> save -> DB check -> reload -> home check confirmed."
                 )
                 return 0
             except Exception as exc:
@@ -276,6 +286,8 @@ def main() -> int:
     finally:
         server_proc.terminate()
         server_proc.wait(timeout=5)
+        worker_proc.terminate()
+        worker_proc.wait(timeout=5)
         temp_dir.cleanup()
 
 

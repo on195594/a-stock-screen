@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -20,7 +21,11 @@ from services import (
     get_company_context,
     get_home,
     get_peer_discover,
+    get_update_job,
+    list_update_jobs,
     mark_seen,
+    peer_anchors,
+    request_peer_update,
     save_watch,
 )
 from workspace import WorkspaceError
@@ -30,6 +35,7 @@ if RAW_MODE not in ("demo", "production"):
     raise ValueError(f"Invalid APP_MODE: '{RAW_MODE}'. Must be 'demo' or 'production'.")
 APP_MODE: Literal["demo", "production"] = "production" if RAW_MODE == "production" else "demo"
 STATE_DIR = Path(os.getenv("STATE_DIR", ".local/demo")).expanduser().resolve()
+TRACKER_ROOT = Path(os.environ["TRACKER_ROOT"]) if os.getenv("TRACKER_ROOT") else None
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8550")
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8550"))
@@ -73,6 +79,9 @@ def build_app():
             "current_form_getter": None,
             "current_company_code": None,
             "current_form_baseline": None,
+            "job_poll_task": None,
+            "pending_peer_request": None,
+            "connected": True,
         }
 
         # Explicit logout in settings handles actor revocation
@@ -80,6 +89,10 @@ def build_app():
         login_msg = ft.Text("", size=13, color=ft.Colors.RED_700)
 
         async def navigate(route: str):
+            poll = page_state.get("job_poll_task")
+            if poll is not None:
+                poll.cancel()
+                page_state["job_poll_task"] = None
             page_state["generation"] += 1
             page_state["route"] = route
             page_state["current_form_getter"] = None
@@ -93,6 +106,9 @@ def build_app():
 
         async def go_settings(e):
             await navigate("/settings")
+
+        async def go_discover(e):
+            await navigate("/discover")
 
         async def handle_login_failure(error_msg: str):
             page_state["generation"] += 1
@@ -146,6 +162,10 @@ def build_app():
             page.on_login = on_login
 
         async def on_logout(e):
+            poll = page_state.get("job_poll_task")
+            if poll is not None:
+                poll.cancel()
+                page_state["job_poll_task"] = None
             page_state["generation"] += 1
             page_state.setdefault("drafts", {}).clear()
             page_state["current_form_getter"] = None
@@ -193,6 +213,9 @@ def build_app():
                 return await render_login()
 
             data = await asyncio.to_thread(get_home, actor, STATE_DIR, APP_MODE)
+            if gen != page_state["generation"] or not actor.is_valid:
+                return await render_login()
+            jobs = await asyncio.to_thread(list_update_jobs, actor, STATE_DIR, APP_MODE)
             if gen != page_state["generation"] or not actor.is_valid:
                 return await render_login()
             items_controls: list[ft.Control] = []
@@ -271,6 +294,19 @@ def build_app():
                     )
                 )
 
+            job_controls: list[ft.Control] = []
+            for job in jobs:
+
+                async def open_job(e, job_id=job["job_id"]):
+                    await navigate(f"/jobs/{job_id}")
+
+                job_controls.append(
+                    ft.Button(
+                        f"{job['anchor']} · {job['target_date']} · {job['phase']}",
+                        on_click=open_job,
+                    )
+                )
+
             return ft.Column(
                 controls=[
                     ft.Container(
@@ -291,7 +327,7 @@ def build_app():
                                 ft.Button(
                                     "更新资料",
                                     disabled=True,
-                                    tooltip="后台更新任务将在S2提供，S1为离线演示",
+                                    tooltip="关注清单单独更新尚未实现；请到同业发现提交同业扫描",
                                 ),
                             ],
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -304,6 +340,11 @@ def build_app():
                         weight=ft.FontWeight.W_600,
                     ),
                     *items_controls,
+                    *(
+                        [ft.Text("最近同业更新", weight=ft.FontWeight.BOLD)] + job_controls
+                        if job_controls
+                        else []
+                    ),
                 ],
                 spacing=8,
             )
@@ -313,12 +354,73 @@ def build_app():
             if not actor or not actor.is_valid:
                 return await render_login()
 
+            try:
+                allowed = await asyncio.to_thread(peer_anchors, actor, TRACKER_ROOT, APP_MODE)
+                anchor_error = ""
+            except ServiceError as exc:
+                allowed, anchor_error = [], str(exc)
+            if gen != page_state["generation"] or not actor.is_valid:
+                return await render_login()
+            codes = {entry["code"] for entry in allowed}
             anchor = page_state["selected_anchor"]
-            disc_data = await asyncio.to_thread(
-                get_peer_discover, actor, anchor, STATE_DIR, APP_MODE
+            if anchor not in codes:
+                anchor = allowed[0]["code"] if allowed else ""
+                page_state["selected_anchor"] = anchor
+            disc_data: dict[str, Any] = (
+                await asyncio.to_thread(get_peer_discover, actor, anchor, STATE_DIR, APP_MODE)
+                if anchor
+                else {"has_run": False, "error": anchor_error or "暂无参照标的"}
             )
             if gen != page_state["generation"] or not actor.is_valid:
                 return await render_login()
+
+            async def on_anchor_select(e):
+                if actor.is_valid and anchor_field.value in codes:
+                    page_state["selected_anchor"] = anchor_field.value
+                    page_state["pending_peer_request"] = None
+                    await navigate("/discover")
+
+            anchor_field = ft.Dropdown(
+                label="参照公司",
+                value=anchor or None,
+                options=[
+                    ft.dropdown.Option(entry["code"], f"{entry['name']} ({entry['code']})")
+                    for entry in allowed
+                ],
+                on_select=on_anchor_select,
+                disabled=not allowed,
+            )
+            update_feedback = ft.Text("", color=ft.Colors.RED_700)
+            submit_button = ft.Button("查找同业", disabled=not allowed)
+
+            async def on_submit(e):
+                submit_button.disabled = True
+                page.update()
+                pending = page_state.get("pending_peer_request")
+                if not pending or pending["anchor"] != anchor:
+                    pending = {"anchor": anchor, "request_id": uuid.uuid4().hex}
+                    page_state["pending_peer_request"] = pending
+                try:
+                    job = await asyncio.to_thread(
+                        request_peer_update,
+                        actor,
+                        anchor,
+                        pending["request_id"],
+                        STATE_DIR,
+                        APP_MODE,
+                        TRACKER_ROOT,
+                    )
+                    if page_state.get("pending_peer_request") is pending:
+                        page_state["pending_peer_request"] = None
+                    if gen == page_state["generation"] and actor.is_valid:
+                        await navigate(f"/jobs/{job['job_id']}")
+                except (ServiceError, WorkspaceError, AuthError) as exc:
+                    if gen == page_state["generation"] and actor.is_valid:
+                        update_feedback.value = str(exc)
+                        submit_button.disabled = False
+                        page.update()
+
+            submit_button.on_click = on_submit
 
             rows_controls: list[ft.Control] = []
             if disc_data.get("has_run"):
@@ -377,16 +479,16 @@ def build_app():
                     ft.Row(
                         controls=[
                             ft.Text("同业发现", size=18, weight=ft.FontWeight.BOLD),
-                            ft.Button(
-                                "查找同业", disabled=True, tooltip="查找同业后台任务将在S2提供"
-                            ),
+                            submit_button,
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
+                    anchor_field,
                     ft.Text(
-                        f"参照标的：{anchor} (估值日: {disc_data.get('valuation_date', '无')})",
+                        f"参照标的：{anchor or '暂无'} (估值日: {disc_data.get('valuation_date', '无')})",
                         size=13,
                     ),
+                    update_feedback,
                     ft.Divider(height=16),
                     *(
                         [
@@ -409,6 +511,69 @@ def build_app():
                     ft.Column(controls=rows_controls, spacing=8),
                 ],
                 spacing=8,
+            )
+
+        async def render_job(job_id: str, gen: int):
+            actor: Actor | None = page_state.get("actor")
+            if not actor or not actor.is_valid:
+                return await render_login()
+            try:
+                job = await asyncio.to_thread(get_update_job, actor, job_id, STATE_DIR, APP_MODE)
+            except ServiceError:
+                return ft.Text("任务不存在或暂不可读取")
+            if gen != page_state["generation"] or not actor.is_valid:
+                return await render_login()
+
+            status_text = ft.Text("")
+
+            def show_status(current: dict[str, Any]):
+                status_text.value = (
+                    f"状态：{current['status']} / {current['phase']} · "
+                    f"数据日：{current['target_date']}"
+                    + (f" · {current['error_summary']}" if current["error_summary"] else "")
+                )
+
+            show_status(job)
+
+            async def poll_job():
+                try:
+                    while True:
+                        await asyncio.sleep(3)
+                        if (
+                            gen != page_state["generation"]
+                            or not actor.is_valid
+                            or not page_state["connected"]
+                        ):
+                            return
+                        latest = await asyncio.to_thread(
+                            get_update_job, actor, job_id, STATE_DIR, APP_MODE
+                        )
+                        if (
+                            gen != page_state["generation"]
+                            or not actor.is_valid
+                            or not page_state["connected"]
+                        ):
+                            return
+                        show_status(latest)
+                        page.update()
+                        if latest["status"] not in ("queued", "running"):
+                            return
+                except (asyncio.CancelledError, AuthError):
+                    return
+                except (ServiceError, WorkspaceError):
+                    if gen == page_state["generation"] and actor.is_valid:
+                        status_text.value = "状态查询失败，请返回首页稍后重试"
+                        page.update()
+
+            if job["status"] in ("queued", "running"):
+                page_state["job_poll_task"] = asyncio.create_task(poll_job())
+            return ft.Column(
+                controls=[
+                    ft.Text("更新任务", size=18, weight=ft.FontWeight.BOLD),
+                    ft.Text(f"参照公司：{job['anchor']}"),
+                    status_text,
+                    ft.Button("返回同业发现", on_click=go_discover),
+                ]
             )
 
         async def render_company(code: str, gen: int):
@@ -767,6 +932,8 @@ def build_app():
                 content = await render_home(gen)
             elif route == "/discover":
                 content = await render_discover(gen)
+            elif route.startswith("/jobs/"):
+                content = await render_job(route.rsplit("/", 1)[-1], gen)
             elif route.startswith("/company/"):
                 c = route.split("/")[-1]
                 content = await render_company(c, gen)
@@ -859,6 +1026,11 @@ def build_app():
 
         async def on_disconnect(e):
             nonlocal watchdog_task
+            page_state["connected"] = False
+            poll = page_state.get("job_poll_task")
+            if poll is not None:
+                poll.cancel()
+                page_state["job_poll_task"] = None
             page_state["generation"] += 1
             if callable(page_state.get("current_form_getter")) and page_state.get(
                 "current_company_code"
@@ -890,6 +1062,7 @@ def build_app():
 
         async def on_connect(e):
             nonlocal watchdog_task
+            page_state["connected"] = True
             if watchdog_task is None or watchdog_task.done():
                 watchdog_task = asyncio.create_task(session_watchdog())
             actor: Actor | None = page_state.get("actor")
@@ -920,6 +1093,11 @@ def build_app():
 
         async def on_close(e):
             nonlocal watchdog_task
+            page_state["connected"] = False
+            poll = page_state.get("job_poll_task")
+            if poll is not None:
+                poll.cancel()
+                page_state["job_poll_task"] = None
             page_state["generation"] += 1
             page_state.setdefault("drafts", {}).clear()
             page_state["current_form_getter"] = None

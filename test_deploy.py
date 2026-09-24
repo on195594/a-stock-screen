@@ -11,6 +11,7 @@ def test_deploy_success_and_config_rollback(tmp_path: Path) -> None:
     (root / "docker").mkdir(parents=True)
     shutil.copyfile(Path(__file__).with_name("deploy.sh"), root / "deploy.sh")
     (root / ".env").write_text("# isolated test\n")
+    (root / ".worker.env").write_text("# isolated test\n")
     (root / "docker-compose.yml").write_text("services: {}\n")
     candidate = root / "docker" / "nginx-stock.conf"
     candidate.write_text("new config\n")
@@ -28,6 +29,7 @@ def test_deploy_success_and_config_rollback(tmp_path: Path) -> None:
         'echo "docker $*" >> "$COMMAND_LOG"\n'
         'if [ "$1 $2 $3 ${4:-}" = "exec nginx nginx -t" ] && '
         'grep -q INVALID "$NGINX_DIR/sites-enabled/stock.conf"; then exit 1; fi\n'
+        'if [ "$1" = inspect ]; then echo "true 0"; fi\n'
     )
     docker.chmod(0o755)
     curl = bin_dir / "curl"
@@ -59,10 +61,13 @@ def test_deploy_success_and_config_rollback(tmp_path: Path) -> None:
     assert len(list(site.parent.glob("stock.conf.bak.*"))) == 1
     calls = log.read_text().splitlines()
     build = next(i for i, line in enumerate(calls) if " build web" in line)
-    up = next(i for i, line in enumerate(calls) if " up -d " in line)
+    up = next(i for i, line in enumerate(calls) if " up -d " in line and line.endswith(" web"))
     reload = next(i for i, line in enumerate(calls) if "nginx -s reload" in line)
+    worker_up = next(
+        i for i, line in enumerate(calls) if " up -d " in line and line.endswith(" worker")
+    )
     check = calls.index("make check")
-    assert check < build < up < reload
+    assert check < build < up < reload < worker_up
     assert any(line.startswith("curl ") for line in calls[up:reload])
     assert any(line.startswith("curl ") for line in calls[reload:])
 

@@ -31,6 +31,30 @@ def test_fetch_financials_rejects_mismatched_code() -> None:
         )
 
 
+def test_fetch_financials_rejects_duplicate_response_rows() -> None:
+    class Frame:
+        columns = ["ts_code", "ann_date", "end_date", "update_flag", "roe_waa"]
+
+        def to_json(self, **_kwargs: object) -> str:
+            row = {
+                "ts_code": "600001.SH",
+                "ann_date": "20260415",
+                "end_date": "20251231",
+                "update_flag": "0",
+                "roe_waa": 10.0,
+            }
+            return json.dumps([row, row])
+
+    class Client:
+        def fina_indicator(self, **_kwargs: object) -> Frame:
+            return Frame()
+
+    with pytest.raises(screen.ScreenError, match="重复记录"):
+        screen.fetch_financials(
+            Client(), "synthetic", "600001.SH", "2026-09-20", "2026-09-20T16:00:00+08:00"
+        )
+
+
 def test_reference_read_is_literal_and_read_only(tmp_path: Path) -> None:
     tracker = tmp_path / "tracker"
     package = tracker / "a_stock_tracker"
