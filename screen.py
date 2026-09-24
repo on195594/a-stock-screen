@@ -87,9 +87,7 @@ def base_code(value: str) -> str:
 
 def read_watchlist(config_path: Path) -> list[dict[str, str]]:
     try:
-        tree = ast.parse(
-            config_path.read_text(encoding="utf-8"), filename=str(config_path)
-        )
+        tree = ast.parse(config_path.read_text(encoding="utf-8"), filename=str(config_path))
     except (OSError, SyntaxError) as exc:
         raise ScreenError(f"无法读取 WATCHLIST: {exc}") from exc
     value_node: ast.expr | None = None
@@ -118,9 +116,7 @@ def read_watchlist(config_path: Path) -> list[dict[str, str]]:
     for item in raw:
         if not isinstance(item, dict) or not isinstance(item.get("code"), str):
             raise ScreenError("WATCHLIST 条目缺少字符串 code")
-        result.append(
-            {"code": base_code(item["code"]), "name": str(item.get("name") or "")}
-        )
+        result.append({"code": base_code(item["code"]), "name": str(item.get("name") or "")})
     return result
 
 
@@ -150,9 +146,7 @@ def load_reference(tracker_root: Path, anchor: str) -> dict[str, Any]:
         "anchor": anchor_code,
         "watchlist": watchlist,
         "watchlist_codes": watchlist_codes,
-        "legacy_reference": read_cached_reference(
-            tracker_root / "tracker.db", anchor_code
-        ),
+        "legacy_reference": read_cached_reference(tracker_root / "tracker.db", anchor_code),
     }
 
 
@@ -173,16 +167,12 @@ def read_token(tracker_root: Path) -> str:
     return token
 
 
-def frame_records(
-    frame: Any, required: set[str], endpoint: str
-) -> list[dict[str, Any]]:
+def frame_records(frame: Any, required: set[str], endpoint: str) -> list[dict[str, Any]]:
     columns = set(getattr(frame, "columns", []))
     missing = required - columns
     if missing:
         raise ScreenError(f"{endpoint} 缺少字段: {', '.join(sorted(missing))}")
-    return json.loads(
-        frame.to_json(orient="records", force_ascii=False, date_format="iso")
-    )
+    return json.loads(frame.to_json(orient="records", force_ascii=False, date_format="iso"))
 
 
 def call_api(client: Any, endpoint: str, token: str, **params: Any) -> Any:
@@ -278,9 +268,7 @@ def load_peers(
     if is_financial_industry(industry):
         raise ScreenError(f"金融行业不适用 peer-screen-v1: {industry}")
 
-    valuations = {
-        normalize_code(str(row["ts_code"])): dict(row) for row in valuation_rows
-    }
+    valuations = {normalize_code(str(row["ts_code"])): dict(row) for row in valuation_rows}
     peers = [
         row
         for code, row in stocks.items()
@@ -310,9 +298,7 @@ def load_peers(
         "industry": industry,
         "industry_source": "tushare.stock_basic",
         "enumerated_count": len(peers),
-        "enumerated_codes": sorted(
-            normalize_code(str(row["ts_code"])) for row in peers
-        ),
+        "enumerated_codes": sorted(normalize_code(str(row["ts_code"])) for row in peers),
         "selected_codes": selected_codes,
         "excluded_missing_valuation": sorted(missing_valuation),
         "excluded_by_cap": [item[1] for item in eligible_others[max(0, cap - 1) :]],
@@ -465,7 +451,10 @@ def fetch_financials(
     if len(records) >= 100:
         raise ScreenError(f"{code} fina_indicator 疑似达到 100 行截断上限")
     acquired_at = now_iso()
+    requested_code = normalize_code(code)
     for row in records:
+        if row.get("ts_code") != requested_code:
+            raise ScreenError(f"{code} fina_indicator 包含错配代码: {row.get('ts_code')}")
         row["source"] = "tushare.fina_indicator"
         row["acquired_at"] = acquired_at
     return records
@@ -503,7 +492,7 @@ def load_inputs(
             "error": "NOT_FETCHED",
         }
         financial_source = "none"
-        if not exclusions:
+        if not exclusions or (pb is not None and pb <= 0):
             local_records = read_local_financials(raw_db, code)
             local_selection = select_annual_roes(local_records, data_date, screened_at)
             if local_selection["error"] is None:
@@ -513,12 +502,8 @@ def load_inputs(
                 if index:
                     time.sleep(0.35)
                 try:
-                    online_records = fetch_financials(
-                        client, token, code, data_date, screened_at
-                    )
-                    financial = select_annual_roes(
-                        online_records, data_date, screened_at
-                    )
+                    online_records = fetch_financials(client, token, code, data_date, screened_at)
+                    financial = select_annual_roes(online_records, data_date, screened_at)
                     financial_source = "tushare.fina_indicator"
                 except ScreenError as exc:
                     financial = {"annual_roes": [], "roe_mean": None, "error": str(exc)}
@@ -555,9 +540,7 @@ def load_inputs(
     return rows, screened_at
 
 
-def average_ranks(
-    rows: list[dict[str, Any]], field: str, reverse: bool
-) -> dict[str, float]:
+def average_ranks(rows: list[dict[str, Any]], field: str, reverse: bool) -> dict[str, float]:
     ordered = sorted(rows, key=lambda row: float(row[field]), reverse=reverse)
     ranks: dict[str, float] = {}
     index = 0
@@ -602,9 +585,7 @@ def rank_peers(
     anchor = normalize_code(anchor)
     anchor_item = next((item for item in ranking if item["code"] == anchor), None)
     watchlist = set(watchlist_codes)
-    outside_qualified = sum(
-        base_code(item["code"]) not in watchlist for item in ranking
-    )
+    outside_qualified = sum(base_code(item["code"]) not in watchlist for item in ranking)
     return {
         "qualified_codes": [item["code"] for item in ranking],
         "ranking": ranking,
@@ -634,12 +615,10 @@ def build_live_snapshot(
 ) -> dict[str, Any]:
     tracker_root = tracker_root.expanduser().resolve()
     reference = load_reference(tracker_root, anchor)
-    data_date = (
-        iso_date(requested_date) if requested_date else default_data_date(tracker_root)
-    )
+    data_date = iso_date(requested_date) if requested_date else default_data_date(tracker_root)
     token = read_token(tracker_root)
     try:
-        import tushare as ts
+        import tushare as ts  # type: ignore[import-untyped]
     except ImportError as exc:
         raise ScreenError("当前 Python 环境缺少 tushare") from exc
     client = ts.pro_api(token, timeout=30)
@@ -661,9 +640,11 @@ def build_live_snapshot(
     generated_at = now_iso()
     scope.update(source_times)
     scope["valuation_date"] = data_date
+    scope["source"] = "tracker"
     return {
         "schema_version": SCHEMA_VERSION,
         "rule": RULE,
+        "source": "tracker",
         "limits": {
             "cap": CAP,
             "top_n": TOP_N,
@@ -689,11 +670,7 @@ def fmt_number(value: Any, digits: int = 2) -> str:
 
 def annual_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
     value = row.get("annual_roes")
-    return (
-        [item for item in value if isinstance(item, dict)]
-        if isinstance(value, list)
-        else []
-    )
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
 def annual_signature(row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -760,9 +737,7 @@ def compare_snapshots(
     previous_codes = set(previous_rows)
     current_codes = set(current_rows)
 
-    def identities(
-        codes: set[str], rows: dict[str, dict[str, Any]]
-    ) -> list[dict[str, str]]:
+    def identities(codes: set[str], rows: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
         return [
             {"code": code, "name": str(rows.get(code, {}).get("name") or "")}
             for code in sorted(codes)
@@ -773,12 +748,8 @@ def compare_snapshots(
     compatible = not incompatibilities
     previous_top = set(previous.get("results", {}).get("top", []))
     current_top = set(current.get("results", {}).get("top", []))
-    top_entries = (
-        identities(current_top - previous_top, current_rows) if compatible else []
-    )
-    top_exits = (
-        identities(previous_top - current_top, previous_rows) if compatible else []
-    )
+    top_entries = identities(current_top - previous_top, current_rows) if compatible else []
+    top_exits = identities(previous_top - current_top, previous_rows) if compatible else []
 
     pb_changes: list[dict[str, Any]] = []
     annual_changes: list[dict[str, Any]] = []
@@ -789,11 +760,7 @@ def compare_snapshots(
         after = current_rows[code]
         previous_pb = finite_number(before.get("pb"))
         current_pb = finite_number(after.get("pb"))
-        if (
-            previous_pb is not None
-            and current_pb is not None
-            and previous_pb != current_pb
-        ):
+        if previous_pb is not None and current_pb is not None and previous_pb != current_pb:
             pb_changes.append(
                 {
                     "code": code,
@@ -886,20 +853,12 @@ def comparison_sections(snapshot: dict[str, Any]) -> list[str]:
         if values:
             lines.append(
                 f"- {label}："
-                + ", ".join(
-                    f"{item['name'] or '—'} `{item['code']}`" for item in values
-                )
+                + ", ".join(f"{item['name'] or '—'} `{item['code']}`" for item in values)
                 + "。"
             )
     if comparison.get("member_change_may_affect_rank"):
-        entered = (
-            ", ".join(item["code"] for item in comparison.get("scope_entries", []))
-            or "无"
-        )
-        exited = (
-            ", ".join(item["code"] for item in comparison.get("scope_exits", []))
-            or "无"
-        )
+        entered = ", ".join(item["code"] for item in comparison.get("scope_entries", [])) or "无"
+        exited = ", ".join(item["code"] for item in comparison.get("scope_exits", [])) or "无"
         lines.append(
             f"- 同业成员范围变化：进入 {entered}；退出 {exited}。范围变化可能影响排名，不代表公司经营恶化。"
         )
@@ -910,12 +869,10 @@ def comparison_sections(snapshot: dict[str, Any]) -> list[str]:
         )
     for item in comparison.get("annual_changes", []):
         before = ", ".join(
-            f"{value['period']}:{fmt_number(value['roe_waa'])}%"
-            for value in item["before"]
+            f"{value['period']}:{fmt_number(value['roe_waa'])}%" for value in item["before"]
         )
         after = ", ".join(
-            f"{value['period']}:{fmt_number(value['roe_waa'])}%"
-            for value in item["after"]
+            f"{value['period']}:{fmt_number(value['roe_waa'])}%" for value in item["after"]
         )
         lines.append(
             f"- 年报/ROE 变化：{item['name'] or '—'} `{item['code']}` [{before}] → [{after}]。"
@@ -955,9 +912,7 @@ def candidate_review_sections(snapshot: dict[str, Any]) -> list[str]:
         row = rows.get(code)
         rank = ranks.get(code)
         if row is None or rank is None:
-            lines.append(
-                f"- 快照中的候选 `{code}` 缺少对应明细或排名，无法生成审查说明。"
-            )
+            lines.append(f"- 快照中的候选 `{code}` 缺少对应明细或排名，无法生成审查说明。")
             continue
         lines.append(f"### {row.get('name') or '—'} `{code}`")
         lines.append("")
@@ -977,12 +932,8 @@ def candidate_review_sections(snapshot: dict[str, Any]) -> list[str]:
             and anchor_roe is not None
             and anchor_pb is not None
         ):
-            row_years = [
-                str(item.get("period") or "")[:4] for item in annual_entries(row)
-            ]
-            anchor_years = [
-                str(item.get("period") or "")[:4] for item in annual_entries(anchor)
-            ]
+            row_years = [str(item.get("period") or "")[:4] for item in annual_entries(row)]
+            anchor_years = [str(item.get("period") or "")[:4] for item in annual_entries(anchor)]
             comparison = (
                 f"相对参照公司，ROE 均值差 {row_roe - anchor_roe:+.2f} 个百分点，"
                 f"PB 差 {row_pb - anchor_pb:+.2f} 倍（候选减参照）"
@@ -993,9 +944,7 @@ def candidate_review_sections(snapshot: dict[str, Any]) -> list[str]:
         else:
             lines.append("- 与参照比较：参照或候选数据不完整，不计算差值。")
 
-        annual = sorted(
-            annual_entries(row), key=lambda item: str(item.get("period") or "")
-        )
+        annual = sorted(annual_entries(row), key=lambda item: str(item.get("period") or ""))
         values = [finite_number(item.get("roe_waa")) for item in annual]
         facts: list[str] = []
         if len(annual) != 3 or any(value is None for value in values):
@@ -1010,11 +959,7 @@ def candidate_review_sections(snapshot: dict[str, Any]) -> list[str]:
                 )
         lines.append(
             "- 已知事实："
-            + (
-                "；".join(facts)
-                if facts
-                else "本次指定字段未触发负 ROE 或最新年度下降提示"
-            )
+            + ("；".join(facts) if facts else "本次指定字段未触发负 ROE 或最新年度下降提示")
             + "。"
         )
         lines.append(
@@ -1034,15 +979,9 @@ def render_report(snapshot: dict[str, Any]) -> str:
         if isinstance(raw_ranking, list)
         else []
     )
-    rank_by_code = {
-        item["code"]: item for item in ranking if isinstance(item.get("code"), str)
-    }
+    rank_by_code = {item["code"]: item for item in ranking if isinstance(item.get("code"), str)}
     raw_top = results.get("top")
-    top = (
-        [code for code in raw_top if isinstance(code, str)]
-        if isinstance(raw_top, list)
-        else []
-    )
+    top = [code for code in raw_top if isinstance(code, str)] if isinstance(raw_top, list) else []
     anchor = snapshot.get("anchor")
     shown = top + ([anchor] if isinstance(anchor, str) and anchor not in top else [])
     raw_scope = snapshot.get("scope")
@@ -1050,11 +989,7 @@ def render_report(snapshot: dict[str, Any]) -> str:
     qualified_count = len(ranking)
     selected_count = len(rows)
     financial_sources = (
-        ", ".join(
-            sorted(
-                {str(row.get("financial_source") or "none") for row in rows.values()}
-            )
-        )
+        ", ".join(sorted({str(row.get("financial_source") or "none") for row in rows.values()}))
         or "none"
     )
     annual_coverages = sorted(
@@ -1097,9 +1032,7 @@ def render_report(snapshot: dict[str, Any]) -> str:
             f"> 已有 {results.get('outside_watchlist_qualified_count', 0)} 家池外公司以完整数据参与比较。"
         )
     else:
-        lines.append(
-            "> **交付缺口：**没有合格池外公司参与比较，本次不能称为完成同业发现。"
-        )
+        lines.append("> **交付缺口：**没有合格池外公司参与比较，本次不能称为完成同业发现。")
     lines.extend(
         [
             "",
@@ -1123,8 +1056,7 @@ def render_report(snapshot: dict[str, Any]) -> str:
         )
         checks = []
         if any(
-            finite_number(item.get("roe_waa")) is not None
-            and float(item["roe_waa"]) < 0
+            finite_number(item.get("roe_waa")) is not None and float(item["roe_waa"]) < 0
             for item in annual_entries(row)
         ):
             checks.append("某年 ROE 为负")
@@ -1237,15 +1169,11 @@ def load_snapshot(input_path: Path) -> dict[str, Any]:
     if not isinstance(snapshot, dict):
         raise ScreenError("快照顶层必须是对象")
     if snapshot.get("schema_version") != SCHEMA_VERSION:
-        raise ScreenError(
-            f"不支持的 schema_version: {snapshot.get('schema_version')!r}"
-        )
+        raise ScreenError(f"不支持的 schema_version: {snapshot.get('schema_version')!r}")
     return snapshot
 
 
-def replay_snapshot(
-    input_path: Path, output_root: Path, compare_path: Path | None = None
-) -> Path:
+def replay_snapshot(input_path: Path, output_root: Path, compare_path: Path | None = None) -> Path:
     snapshot = load_snapshot(input_path)
     rows, replay_warnings = indexed_rows(snapshot)
     rank_fields = {"exclusions", "annual_roes", "pb", "roe_mean"}
@@ -1309,9 +1237,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.input:
             if args.anchor or args.date or args.refresh or args.tracker_root:
-                raise ScreenError(
-                    "--input 与 --anchor/--date/--refresh/--tracker-root 互斥"
-                )
+                raise ScreenError("--input 与 --anchor/--date/--refresh/--tracker-root 互斥")
             directory = replay_snapshot(args.input, output_root, args.compare)
         else:
             if not args.anchor:
@@ -1326,9 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             snapshot = build_live_snapshot(tracker_root, args.anchor, args.date)
             if previous is not None:
-                snapshot["comparison"] = compare_snapshots(
-                    previous, snapshot, args.compare
-                )
+                snapshot["comparison"] = compare_snapshots(previous, snapshot, args.compare)
             directory = save_output(snapshot, output_root)
         print(directory)
         return 0

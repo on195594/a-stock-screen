@@ -2,8 +2,33 @@ import json
 import sqlite3
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 import screen
+
+
+def test_fetch_financials_rejects_mismatched_code() -> None:
+    class Frame:
+        columns = ["ts_code", "ann_date", "end_date", "update_flag", "roe_waa"]
+
+        def to_json(self, **_kwargs: object) -> str:
+            return json.dumps(
+                [
+                    {"ts_code": "600001.SH"},
+                    {"ts_code": "600002.SH"},
+                ]
+            )
+
+    class Client:
+        def fina_indicator(self, **_kwargs: object) -> Frame:
+            return Frame()
+
+    with pytest.raises(screen.ScreenError, match="fina_indicator 包含错配代码: 600002.SH"):
+        screen.fetch_financials(
+            Client(), "unused", "600001.SH", "2026-09-20", "2026-09-20T16:00:00+08:00"
+        )
 
 
 def test_reference_read_is_literal_and_read_only(tmp_path: Path) -> None:
@@ -89,9 +114,7 @@ def test_scope_cap_and_average_tie_ranking() -> None:
         {"ts_code": "000001.SZ", "pb": 2, "total_mv": 90},
         {"ts_code": "600002.SH", "pb": 3, "total_mv": 80},
     ]
-    selected, scope, _ = screen.load_peers(
-        stocks, valuations, "600900.SH", ["600900"], cap=3
-    )
+    selected, scope, _ = screen.load_peers(stocks, valuations, "600900.SH", ["600900"], cap=3)
     assert [row["ts_code"] for row in selected] == [
         "600900.SH",
         "600001.SH",
@@ -170,9 +193,7 @@ def test_three_year_selection_prefers_unique_revision_and_rejects_gap() -> None:
             "source": "test",
         },
     ]
-    selected = screen.select_annual_roes(
-        records, "2026-09-22", "2026-09-22T20:00:00+08:00"
-    )
+    selected = screen.select_annual_roes(records, "2026-09-22", "2026-09-22T20:00:00+08:00")
     assert selected["error"] is None
     assert selected["roe_mean"] == 10
     assert selected["annual_roes"][-1]["roe_waa"] == 9
@@ -181,9 +202,7 @@ def test_three_year_selection_prefers_unique_revision_and_rejects_gap() -> None:
 
     gap = [row for row in records if row["end_date"] != "20241231"]
     assert (
-        screen.select_annual_roes(gap, "2026-09-22", "2026-09-22T20:00:00+08:00")[
-            "error"
-        ]
+        screen.select_annual_roes(gap, "2026-09-22", "2026-09-22T20:00:00+08:00")["error"]
         == "MISSING_THREE_ANNUAL_REPORTS"
     )
 
@@ -406,7 +425,7 @@ def test_compare_classifies_member_change_without_calling_it_deterioration(
         "screened_at": "2026-09-22T20:00:00+08:00",
         "data_date": "2026-09-22",
     }
-    previous = {
+    previous: dict[str, Any] = {
         **common,
         "rows": [row("600900.SH", "参照", 3), row("600001.SH", "旧成员", 1)],
         "results": {"top": ["600001.SH", "600900.SH"]},
@@ -433,9 +452,7 @@ def test_compare_classifies_member_change_without_calling_it_deterioration(
     missing = deepcopy(previous)
     missing["rows"][1]["pb"] = None
     missing["rows"][1]["annual_roes"] = []
-    changed = screen.compare_snapshots(
-        previous, missing, tmp_path / "before-missing.json"
-    )
+    changed = screen.compare_snapshots(previous, missing, tmp_path / "before-missing.json")
     assert changed["newly_missing"] == [
         {
             "code": "600001.SH",

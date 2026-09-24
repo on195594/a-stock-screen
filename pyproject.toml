@@ -1,0 +1,44 @@
+[project]
+name = "a-stock-screen"
+version = "0.2.0"
+description = "A-share peer screening and personal research workbench"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flet[web]==1.0.1",
+    "uvicorn>=0.30.0",
+    "pandas>=2.2.0",
+    "requests>=2.31.0",
+    "tushare>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+    "playwright>=1.45.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-q -o cache_dir=/tmp/.pytest_cache"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+]
+ignore = [
+    "E501",
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = false
+warn_unused_ignores = true

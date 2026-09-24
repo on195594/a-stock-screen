@@ -1,0 +1,22 @@
+{
+  "anchor": "600001.SH",
+  "data_date": "2026-09-10",
+  "formula": "unverified_experimental_formula",
+  "generated_at": "2026-09-10T16:00:00+08:00",
+  "screened_at": "2026-09-10T16:00:00+08:00",
+  "rule": "peer-screen-v0-legacy",
+  "schema_version": 1,
+  "source": "fixture",
+  "is_fixture": true,
+  "replayed_from": "legacy_replay_snapshot_001",
+  "legacy_reference": {
+    "industry": "专用设备",
+    "name": "示例公司甲",
+    "updated_at": "2026-09-10 09:15:00"
+  },
+  "results": {
+    "anchor_position": 1,
+    "discovery_complete": true
+  },
+  "rows": []
+}

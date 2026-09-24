@@ -1,0 +1,30 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: a-stock-screen-web
+    restart: unless-stopped
+    networks:
+      - nginx-network
+    ports:
+      - "127.0.0.1:8550:8550"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - APP_MODE=production
+      - STATE_DIR=/app/data
+      - PUBLIC_BASE_URL=https://stock.keyi.win
+      - HOST=0.0.0.0
+      - PORT=8550
+      - JOURNAL_MODE=DELETE
+      - FLET_SESSION_TIMEOUT=3600
+      - FLET_OAUTH_STATE_TIMEOUT=600
+      # GitHub OAuth (configured in .env)
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      - GITHUB_ALLOWED_USER_ID=${GITHUB_ALLOWED_USER_ID}
+
+networks:
+  nginx-network:
+    external: true

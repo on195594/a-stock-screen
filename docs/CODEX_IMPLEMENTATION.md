@@ -1,17 +1,17 @@
 # Codex 开发任务：Flet Web端投资研究工作台（兼容移动端浏览器）
 
 > 2026-09-23 · 执行方案1.0 · 设计依据：[FLET_DESIGN.md](FLET_DESIGN.md)
-> 这是待执行合同，**本次只修订文档，没有实施或验证应用**。实际工作区可能已有部分实现，应先核对再补差量；不能仅凭本文把已做或未做的任务写成通过。下文命令是需要建立的入口。
+> 本文记录编写时的待执行合同，不能据此推断当前实施或验收状态。当前代码范围与可运行入口见 [文档导航](README.md)；实际工作区可能已前进，应先核对再补差量。
 
 ## 渐进式实施导引（Progressive Disclosure）
 
-本文按工程交付切片组织。实施时严格采用**渐进式推进**，当前阶段切勿过早阅读或实现后续阶段逻辑：
+本文按原定工程交付切片组织；下表区分当前代码状态与编写时建议的阅读顺序，不把历史待办当成已完成的部署：
 
-| 交付切片 | 当前状态 | 关注章节 | 暂缓阅读（YAGNI，当前勿读） |
+| 交付切片 | 当前状态 | 关注章节 | 原定暂缓阅读（YAGNI） |
 |---|---|---|---|
-| **S1 基础界面与状态** | **当前执行** | [S1：Web端能看资料、保存判断（兼容移动端）](#s1web端能看资料保存判断兼容移动端重启不丢) · [§0 执行方式](#0-执行方式) | S2、S3、§3 部署资产 |
-| **S2 任务与 Worker** | 待 S1 验收后开启 | [S2：Web端提交更新](#s2web端提交更新关闭页面后服务器继续完成) | S3（未阅展示） |
-| **S3 变化与移动端收口** | 待 S2 验收后开启 | [S3：未阅变化、移动真机与VPS使用收口](#s3未阅变化移动真机与vps使用收口) | - |
+| **S1 基础界面与状态** | 页面、存储与离线检查已有代码；生产 OAuth 与真机未验收 | [S1：Web端能看资料、保存判断（兼容移动端）](#s1web端能看资料保存判断兼容移动端重启不丢) · [§0 执行方式](#0-执行方式) | S2、S3 的业务实现 |
+| **S2 任务与 Worker** | 未实现；更新按钮禁用 | [S2：Web端提交更新](#s2web端提交更新关闭页面后服务器继续完成) | S3（未阅展示） |
+| **S3 变化与移动端收口** | 未验收；本机已有 Docker/Nginx Web 部署，不代表 worker/真机可用 | [S3：未阅变化、移动真机与VPS使用收口](#s3未阅变化移动真机与vps使用收口) | - |
 | **参考规范** | 按需查阅 | [1. 12组业务验收](#1-与业务直接相关的12组验收) · [2. Codex配置](#2-codex配置和使用) · [4. 停止规则](#4-轻量停止规则) | 仅在对齐测试或配置时查阅 |
 
 ---
@@ -172,14 +172,14 @@ SQLite个人记录，以及可配置的GitHub OAuth单用户边界。
 
 ## 3. 部署资产要生成什么
 
-以下是S3应生成并验证的文件，而非已经部署的配置：
+以下是编写时拟定的 systemd/Caddy 部署资产，不是当前本机操作说明；当前已采用 Docker Compose + Nginx 运行 Web，独立 worker 与备份/恢复入口未实现。实际部署及限制见[项目说明](../README.md)：
 
 | 资产 | 关键内容 |
 |---|---|
 | `deploy/Caddyfile.example` | HTTPS域名、localhost反向代理；不配私有目录file_server；WebSocket与回调可用 |
 | `deploy/a-stock-screen-web.service` | 低权限、固定提交/venv、web.env、单ASGI worker、Umask=0077、无reload；保护代码、只开放运行目录写权限 |
 | `deploy/a-stock-screen-worker.service` | 同提交、worker.env、串行锁、SIGTERM处理、Restart=on-failure；不自动重试failed/interrupted |
-| `.env.example` | 只有变量名、非敏感默认和明确占位；不含真实ID/token/域名 |
+| `.env.example` | 公开的回调域名示例与凭据占位符；不含真实 OAuth ID、secret 或 Token |
 | README部署小节 | 角色配置、SQLite模式与库版本、init/import、启动、OAuth/WS检查、备份/新目录恢复、回滚；说明移动端其他平台未测边界 |
 
 拟定入口合同：网页导出app:asgi_app，导入无副作用，启动在ASGI lifespan检查配置；包装Flet应用时透传lifespan和所有必要WebSocket/OAuth路径，禁止upload。worker为python worker.py；manage.py提供init/import/backup/restore，只有init建表，restore只写新目录且中断备份中未完成任务。Codex须按锁定Flet版本实现并验证，不把官方旧同步样例直接粘入1.0事件回调。示例服务启动可以使用：

@@ -3,7 +3,7 @@
 > 设计版本：1.0 · 2026-09-23
 > 适用项目：`on195594/a-stock-screen`；核对基线 `9cfd9a2f09dea94f3d4cb11f0e7e7f726c2f0090`。
 > 使用者：所有者本人；主要终端：Web端，兼容移动端浏览器；部署：一台 Linux VPS。
-> 本文是待实施设计，不是已完成的软件或生产验收。配套执行顺序见 [CODEX_IMPLEMENTATION.md](CODEX_IMPLEMENTATION.md)。
+> 本文是目标设计，不是已完成的软件或生产验收；当前实施范围与限制见 [文档导航](README.md)。配套执行顺序见 [CODEX_IMPLEMENTATION.md](CODEX_IMPLEMENTATION.md)。原拟 Caddy/systemd 与独立 worker 尚非本机现状：当前部署为 Docker Compose + Nginx 的 Web 容器，worker 未实现；demo 配置了 `FLET_WEB_NO_CDN=true`，生产 Compose 尚未配置。
 
 ## 渐进式设计导引（Progressive Disclosure）
 
@@ -48,7 +48,7 @@ Flet 官方于 2026-09-15 发布 1.0；动态 Web 以 ASGI 运行。实现时以
 
 ### 1.3 与现有约束的准确关系
 
-当前 AGENTS 要求只用 CLI、手动指定比较快照、不得新增数据库，并依赖相邻 tracker 环境。[R1][R2] 本轮在 **a-stock-screen** 内明确放宽这四项：允许 Flet 网页、兼容快照自动比较、个人状态库和独立开发环境。保留旧 CLI；`--input` 继续离线，`--refresh` 继续是 CLI 的联网授权。
+旧版约束基线曾要求只用 CLI、手动指定比较快照、不得新增数据库，并依赖相邻 tracker 环境。[R1][R2] 本轮在 **a-stock-screen** 内明确放宽这四项：允许 Flet 网页、兼容快照自动比较、个人状态库和独立开发环境。保留旧 CLI；`--input` 继续离线，`--refresh` 继续是 CLI 的联网授权。
 
 网页上的“更新资料/查找同业”是新的显式联网授权入口。OAuth 登录所需网络与行情更新分开；打开首页、切页、保存备注和标记已阅不能触发行情请求。
 
@@ -397,9 +397,11 @@ Web端与移动端浏览器首选**同标签页授权**，采用锁定版本支�
 
 原Flet运行时可能注册 `/upload`，本轮在ASGI层明确关闭该路径的所有方法，不配置upload_dir，不把“不放上传按钮”当作关闭上传。[F2][F8] assets仅公开图标/主题，STATE_DIR及tracker目录不能挂静态；也不提供私人快照下载路由。用户文本按纯文本处理，外部https链接只在浏览器打开，不服务端请求，拒绝javascript/data/file及带凭据URL。
 
-应用、Uvicorn和Caddy都不得记录OAuth回调查询串、access/refresh token、私人正文或SQL载荷。关闭默认access log不足以防止异常链泄露；网页错误只返回短代码和脱敏摘要，日志也做脱敏，不打印 `page.auth`、原始提供方异常链或配置全集。退出只退出当前应用会话，不声称自动退出其他设备或撤销GitHub账号登录。
+应用、Uvicorn和反向代理（原拟 Caddy，当前 Nginx）都不得记录OAuth回调查询串、access/refresh token、私人正文或SQL载荷。关闭默认access log不足以防止异常链泄露；网页错误只返回短代码和脱敏摘要，日志也做脱敏，不打印 `page.auth`、原始提供方异常链或配置全集。退出只退出当前应用会话，不声称自动退出其他设备或撤销GitHub账号登录。
 
 ### 6.3 部署形态
+
+以下是原拟的 systemd/Caddy 部署形态，不是当前本机操作说明；实际 Docker/Nginx 启动见[项目说明](../README.md)。
 
 建议路径：
 
@@ -419,6 +421,8 @@ Flet动态Web的引擎/字体资源需要可达，不能“Python不联网”就
 仅生成 systemd/Caddy 示例和检查命令；Codex不安装系统服务、不覆盖现有Caddy、不打开防火墙、不读取生产secret，除非另获明确部署授权。
 
 ### 6.4 配置清单（均为拟实现配置）
+
+下表是原目标；当前 demo 的 `FLET_WEB_NO_CDN=true` 已生效，生产 Compose 尚未设置该项，不能把目标值当成已验证的部署状态。
 
 | 配置 | demo | production |
 |---|---|---|

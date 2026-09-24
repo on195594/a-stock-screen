@@ -1,0 +1,130 @@
+{
+  "anchor": "600001.SH",
+  "data_date": "2026-09-21",
+  "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
+  "generated_at": "2026-09-21T16:00:00+08:00",
+  "screened_at": "2026-09-21T16:00:00+08:00",
+  "rule": "peer-screen-v1",
+  "schema_version": 1,
+  "source": "fixture",
+  "is_fixture": true,
+  "legacy_reference": {
+    "industry": "专用设备",
+    "name": "示例公司甲",
+    "updated_at": "2026-09-21 09:15:00"
+  },
+  "limits": {
+    "cap": 50,
+    "max_report_age_days": 550,
+    "top_n": 3
+  },
+  "scope": {
+    "source": "fixture",
+    "industry": "专用设备",
+    "cap": 50,
+    "enumerated_count": 3,
+    "total_candidates": 3,
+    "enumerated_codes": [
+      "600001.SH",
+      "600002.SH",
+      "600003.SH"
+    ],
+    "selected_codes": [
+      "600001.SH",
+      "600002.SH",
+      "600003.SH"
+    ],
+    "excluded_missing_valuation": [],
+    "excluded_by_cap": []
+  },
+  "watchlist_codes": ["600001.SH"],
+  "results": {
+    "anchor_position": 1,
+    "discovery_complete": false,
+    "outside_watchlist_qualified_count": 1,
+    "qualified_codes": [
+      "600001.SH",
+      "600002.SH"
+    ],
+    "top": [
+      "600001.SH",
+      "600002.SH"
+    ],
+    "ranking": [
+      {
+        "code": "600001.SH",
+        "name": "示例公司甲",
+        "position": 1,
+        "pb_rank": 2.0,
+        "roe_rank": 1.0,
+        "research_order": 1.5
+      },
+      {
+        "code": "600002.SH",
+        "name": "示例公司乙",
+        "position": 2,
+        "pb_rank": 1.0,
+        "roe_rank": 2.0,
+        "research_order": 1.5
+      }
+    ]
+  },
+  "rows": [
+    {
+      "code": "600001.SH",
+      "name": "示例公司甲",
+      "pb": 1.80,
+      "valuation_date": "2026-09-21",
+      "valuation_source": "fixture",
+      "financial_source": "fixture",
+      "risk_source": "fixture",
+      "valuation_status": "ok",
+      "financial_status": "ok",
+      "financial_checked_at": "2026-09-21T16:00:00+08:00",
+      "annual_roes": [
+        {"year": 2023, "roe": 12.5, "ann_date": "2024-04-15", "source": "fixture"},
+        {"year": 2024, "roe": 14.2, "ann_date": "2025-04-20", "source": "fixture"},
+        {"year": 2025, "roe": 16.5, "ann_date": "2026-09-21", "source": "fixture"}
+      ],
+      "roe_mean": 14.40,
+      "facts_usable": true,
+      "eligibility_reasons": ["qualified"]
+    },
+    {
+      "code": "600002.SH",
+      "name": "示例公司乙",
+      "pb": 1.18,
+      "valuation_date": "2026-09-21",
+      "valuation_source": "fixture",
+      "financial_source": "fixture",
+      "risk_source": "fixture",
+      "valuation_status": "ok",
+      "financial_status": "ok",
+      "financial_checked_at": "2026-09-21T16:00:00+08:00",
+      "annual_roes": [
+        {"year": 2023, "roe": 11.0, "ann_date": "2024-04-10", "source": "fixture"},
+        {"year": 2024, "roe": 13.5, "ann_date": "2025-04-12", "source": "fixture"},
+        {"year": 2025, "roe": 14.0, "ann_date": "2026-04-15", "source": "fixture"}
+      ],
+      "roe_mean": 12.83,
+      "facts_usable": true,
+      "eligibility_reasons": ["qualified"]
+    },
+    {
+      "code": "600003.SH",
+      "name": "示例公司丙",
+      "pb": 1.48,
+      "valuation_date": "2026-09-21",
+      "valuation_source": "fixture",
+      "financial_source": "fixture",
+      "risk_source": "fixture",
+      "valuation_status": "ok",
+      "financial_status": "failed",
+      "financial_checked_at": "2026-09-20T16:00:00+08:00",
+      "annual_roes": null,
+      "roe_mean": null,
+      "facts_usable": false,
+      "eligibility_reasons": ["financial_fetch_failed"]
+    }
+  ]
+}
