@@ -1,6 +1,6 @@
 # a-stock-screen
 
-个人同业研究工具：`screen.py` 用当前 TuShare 基础信息、同日 PB 与连续三年 `roe_waa` 安排研究顺序；Flet Web 工作台用于查看快照、提交同业扫描和保存个人研究记录。不是买入建议、收益模型或 Framework A 的延续。设计与实施边界见 [文档导航](docs/README.md)、[Flet 设计](docs/FLET_DESIGN.md)和[实施切片](docs/CODEX_IMPLEMENTATION.md)。
+个人同业研究工具：`screen.py` 用当前 TuShare 基础信息、同日 PB 与连续三年 `roe_waa` 安排研究顺序；Flet Web 工作台用于查看快照、提交同业扫描和保存个人研究记录。不是买入建议、收益模型或 Framework A 的延续。设计与实施边界见 [文档导航](docs/README.md)、[Flet 设计](docs/FLET_DESIGN.md)和[实施路线图](docs/CODEX_IMPLEMENTATION.md)。下一步按“扫描看得懂 → 持续研究 → 真机与生产验收”补差量；这不是功能已完成的声明。
 
 ## Web 工作台命令
 
@@ -20,7 +20,7 @@
 
 ## VPS 部署（仅在本机执行）
 
-此 VPS 当前运行的是**上一版 Web**，本次新增 worker/参照选择尚未部署。仓库的 Docker Compose 已定义 Web + 独立 worker；Docker Nginx 位于 `/home/lin/nginx`。生产部署前，本人须将 `.worker.env.example` 复制为仅本机使用的 `.worker.env`，填入 `TUSHARE_TOKEN`（不要将它交给 Web，也不要提交 Git）；已存在的 `.env` 仅供 Web 认证。Compose 只读挂载 tracker 的关注清单、已证明日历和原库；原库不被修改。先核对 `data/` 是 production 工作区、日历覆盖昨日和只读源路径可访问，再经明确授权在本机运行 `./deploy.sh`。脚本预检、`make check`、构建重建 Web、校验/平滑重载 Nginx、回环 HTTPS 检查，最后启动并检查 worker；失败非零退出，**不自动回滚已重建的 Web**。生产 Compose 仍可能加载公共 CDN；demo 使用本地资源。仅支持此 VPS 布局，需 Docker 权限和独立环境；不要在 demo 环境执行部署。提交 Git 不会自动部署；`.env`、`.worker.env`、工作区均不得提交。
+仓库的 Docker Compose 已定义 Web + 独立 worker；实际运行版本及部署状态需实时核对，容器运行不等于生产数据或真机验收。Docker Nginx 位于 `/home/lin/nginx`。生产部署前，本人须将 `.worker.env.example` 复制为仅本机使用的 `.worker.env`，填入 `TUSHARE_TOKEN`（不要将它交给 Web，也不要提交 Git）；已存在的 `.env` 仅供 Web 认证。Compose 只读挂载 tracker 的关注清单、已证明日历和原库；原库不被修改。先核对 `data/` 是 production 工作区、日历覆盖昨日和只读源路径可访问，再经明确授权在本机运行 `./deploy.sh`。脚本预检、`make check`、构建重建 Web、校验/平滑重载 Nginx、回环 HTTPS 检查，最后启动并检查 worker；失败非零退出，**不自动回滚已重建的 Web**。生产 Compose 仍可能加载公共 CDN；demo 使用本地资源。仅支持此 VPS 布局，需 Docker 权限和独立环境；不要在 demo 环境执行部署。提交 Git 不会自动部署；`.env`、`.worker.env`、工作区均不得提交。
 
 ## CLI 历史脚本使用
 
