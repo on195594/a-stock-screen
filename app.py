@@ -7,7 +7,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from auth import (
     Actor,
@@ -16,12 +16,14 @@ from auth import (
     create_demo_actor,
     create_owner_actor,
 )
+from screen import fmt_number
 from services import (
     ServiceError,
     get_company_context,
     get_home,
     get_peer_discover,
     get_update_job,
+    job_status_label,
     list_update_jobs,
     mark_seen,
     peer_anchors,
@@ -65,6 +67,8 @@ def build_app():
     async def main(page: ft.Page):
         page.title = "投研工作台"
         page.theme_mode = ft.ThemeMode.LIGHT
+        page.fonts = {"NotoSansSC": "fonts/NotoSansSC-Regular.otf"}
+        page.theme = ft.Theme(font_family="NotoSansSC")
         page.padding = 16
         page.scroll = ft.ScrollMode.AUTO
 
@@ -73,7 +77,6 @@ def build_app():
             "actor": create_demo_actor() if APP_MODE == "demo" else None,
             "route": "/" if APP_MODE == "demo" else "/login",
             "selected_anchor": "600001.SH",
-            "active_code": "600001.SH",
             "generation": 0,
             "drafts": {},
             "current_form_getter": None,
@@ -82,24 +85,95 @@ def build_app():
             "job_poll_task": None,
             "pending_peer_request": None,
             "connected": True,
+            "company_return": "/",
+            "scroll_positions": {},
+            "expanded_sections": {},
         }
 
         # Explicit logout in settings handles actor revocation
         content_container = ft.Container(expand=True)
         login_msg = ft.Text("", size=13, color=ft.Colors.RED_700)
 
-        async def navigate(route: str):
+        async def navigate(route: str, *, from_browser: bool = False):
+            getter = page_state.get("current_form_getter")
+            actor = page_state.get("actor")
+            if (
+                route != page_state["route"]
+                and route != "/login"
+                and actor
+                and actor.is_valid
+                and callable(getter)
+                and getter() != page_state.get("current_form_baseline")
+            ):
+                if from_browser:
+                    await page.push_route(page_state["route"])
+                current_gen = page_state["generation"]
+
+                async def stay(e):
+                    page.pop_dialog()
+
+                async def discard(e):
+                    page.pop_dialog()
+                    if current_gen != page_state["generation"] or not actor.is_valid:
+                        return
+                    page_state["drafts"].pop(page_state.get("current_company_code"), None)
+                    page_state["current_form_getter"] = None
+                    await navigate(route)
+
+                async def save_and_leave(e):
+                    page.pop_dialog()
+                    if current_gen != page_state["generation"] or not actor.is_valid:
+                        return
+                    await page_state["save_current_form"](e)
+                    if (
+                        current_gen == page_state["generation"]
+                        and actor.is_valid
+                        and getter() == page_state.get("current_form_baseline")
+                    ):
+                        await navigate(route)
+
+                page.show_dialog(
+                    ft.AlertDialog(
+                        modal=True,
+                        title=ft.Text("有未保存的研究记录"),
+                        content=ft.Text("保存成功后才能离开；放弃不会更改已保存记录。"),
+                        actions=[
+                            ft.TextButton("继续编辑", on_click=stay),
+                            ft.TextButton("放弃并离开", on_click=discard),
+                            ft.TextButton("保存并离开", on_click=save_and_leave),
+                        ],
+                    )
+                )
+                return
             poll = page_state.get("job_poll_task")
             if poll is not None:
                 poll.cancel()
                 page_state["job_poll_task"] = None
             page_state["generation"] += 1
+            if route.startswith("/company/") and not page_state["route"].startswith("/company/"):
+                page_state["company_return"] = page_state["route"]
             page_state["route"] = route
             page_state["current_form_getter"] = None
             page_state["current_company_code"] = None
             page_state["current_form_baseline"] = None
+            if not from_browser:
+                await page.push_route(route)
             await render_current_view()
             page.update()
+            await page.scroll_to(offset=page_state["scroll_positions"].get(route, 0), duration=0)
+
+        async def on_route_change(e):
+            if e.route != page_state["route"]:
+                await navigate(e.route, from_browser=True)
+
+        def on_scroll(e):
+            page_state["scroll_positions"][page_state["route"]] = e.pixels
+
+        page.on_route_change = on_route_change
+        page.views[0].on_scroll = on_scroll
+
+        async def go_back(e):
+            await navigate(page_state["company_return"])
 
         async def go_home(e):
             await navigate("/")
@@ -108,7 +182,7 @@ def build_app():
             await navigate("/settings")
 
         async def go_discover(e):
-            await navigate("/discover")
+            await navigate("/discover?" + urlencode({"anchor": page_state["selected_anchor"]}))
 
         async def handle_login_failure(error_msg: str):
             page_state["generation"] += 1
@@ -239,7 +313,6 @@ def build_app():
                 )
 
                 async def on_card_click(e, c=code):
-                    page_state["active_code"] = c
                     await navigate(f"/company/{c}")
 
                 change_desc = it["change_summary"] if it["has_change"] else "覆盖字段暂无未阅变化"
@@ -302,7 +375,7 @@ def build_app():
 
                 job_controls.append(
                     ft.Button(
-                        f"{job['anchor']} · {job['target_date']} · {job['phase']}",
+                        f"{job['anchor']} · {job['target_date']} · {job_status_label(job)}",
                         on_click=open_job,
                     )
                 )
@@ -333,6 +406,11 @@ def build_app():
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         ),
                     ),
+                    ft.Text("固定关注更新尚未接入；同业扫描不会替代关注清单更新。", size=13),
+                    ft.Button(
+                        "开始同业研究" if not data["total_watch_count"] else "前往同业扫描",
+                        on_click=go_discover,
+                    ),
                     ft.Divider(height=16),
                     ft.Text(
                         f"关注清单 ({data['total_watch_count']})",
@@ -362,15 +440,34 @@ def build_app():
             if gen != page_state["generation"] or not actor.is_valid:
                 return await render_login()
             codes = {entry["code"] for entry in allowed}
-            anchor = page_state["selected_anchor"]
-            if anchor not in codes:
+            params = parse_qs(urlparse(page_state["route"]).query)
+            anchor = params.get("anchor", [page_state["selected_anchor"]])[0]
+            job_id = params.get("job", [None])[0]
+            run_id = page_state.get("discover_boards", {}).get(page_state["route"])
+            if anchor not in codes and not params.get("anchor"):
                 anchor = allowed[0]["code"] if allowed else ""
                 page_state["selected_anchor"] = anchor
-            disc_data: dict[str, Any] = (
-                await asyncio.to_thread(get_peer_discover, actor, anchor, STATE_DIR, APP_MODE)
-                if anchor
-                else {"has_run": False, "error": anchor_error or "暂无参照标的"}
-            )
+            page_state["selected_anchor"] = anchor
+            try:
+                disc_data: dict[str, Any] = (
+                    await asyncio.to_thread(
+                        get_peer_discover,
+                        actor,
+                        anchor,
+                        STATE_DIR,
+                        APP_MODE,
+                        job_id=job_id,
+                        run_id=run_id,
+                    )
+                    if anchor
+                    else {"has_run": False, "error": anchor_error or "暂无参照标的"}
+                )
+            except ServiceError as exc:
+                disc_data = {"has_run": False, "error": str(exc)}
+            if gen == page_state["generation"] and actor.is_valid and disc_data.get("has_run"):
+                page_state.setdefault("discover_boards", {})[page_state["route"]] = disc_data[
+                    "run_id"
+                ]
             if gen != page_state["generation"] or not actor.is_valid:
                 return await render_login()
 
@@ -378,11 +475,11 @@ def build_app():
                 if actor.is_valid and anchor_field.value in codes:
                     page_state["selected_anchor"] = anchor_field.value
                     page_state["pending_peer_request"] = None
-                    await navigate("/discover")
+                    await navigate("/discover?" + urlencode({"anchor": anchor_field.value}))
 
             anchor_field = ft.Dropdown(
                 label="参照公司",
-                value=anchor or None,
+                value=anchor if anchor in codes else None,
                 options=[
                     ft.dropdown.Option(entry["code"], f"{entry['name']} ({entry['code']})")
                     for entry in allowed
@@ -391,7 +488,7 @@ def build_app():
                 disabled=not allowed,
             )
             update_feedback = ft.Text("", color=ft.Colors.RED_700)
-            submit_button = ft.Button("查找同业", disabled=not allowed)
+            submit_button = ft.Button("查找同业", disabled=anchor not in codes)
 
             async def on_submit(e):
                 submit_button.disabled = True
@@ -422,57 +519,323 @@ def build_app():
 
             submit_button.on_click = on_submit
 
-            rows_controls: list[ft.Control] = []
-            if disc_data.get("has_run"):
-                verified_rows = disc_data.get("rows", [])
-                code_to_name = {
-                    str(r.get("code") or r.get("ts_code")): r.get("name")
-                    for r in verified_rows
-                    if isinstance(r, dict)
+            async def refresh_result(e):
+                route = "/discover?" + urlencode({"anchor": anchor})
+                page_state.setdefault("discover_boards", {}).pop(route, None)
+                await navigate(route)
+
+            def section(title: str, controls: list[ft.Control]) -> ft.Column:
+                key = (page_state["route"], title)
+                body = ft.Column(controls, visible=page_state["expanded_sections"].get(key, False))
+
+                async def toggle(e):
+                    if gen == page_state["generation"] and actor.is_valid:
+                        body.visible = not body.visible
+                        page_state["expanded_sections"][key] = body.visible
+                        page.update()
+
+                return ft.Column([ft.Button(title, on_click=toggle), body])
+
+            def exclusion_text(row: dict[str, Any]) -> str:
+                labels = {
+                    "KNOWN_ST_WARNING": "已知风险警示",
+                    "INVALID_PB": "PB缺失或非正值",
+                    "NON_POSITIVE_ROE_MEAN": "三年ROE均值非正值",
+                    "FINANCIAL_REQUEST_FAILED": "财务核查失败",
+                    "MISSING_THREE_ANNUAL_REPORTS": "缺少三份年报",
+                    "NON_CONSECUTIVE_ANNUAL_REPORTS": "年报年份不连续",
+                    "LATEST_ANNUAL_REPORT_TOO_OLD": "最新年报过旧",
+                    "AMBIGUOUS_VERSION": "年报版本有歧义",
+                    "INVALID_ROE": "ROE数据无效",
+                    "qualified": "符合本次筛选字段要求",
                 }
-                ranking_raw = disc_data.get("results", {}).get("ranking", [])
-                ranking = (
-                    [r for r in ranking_raw if isinstance(r, dict)]
-                    if isinstance(ranking_raw, list)
-                    else []
+                reasons = row.get("exclusions") or row.get("eligibility_reasons") or []
+                return (
+                    "；".join(
+                        labels.get(str(r).split(":")[0], "其他数据缺口，需核查来源")
+                        for r in reasons
+                    )
+                    or "未记录"
                 )
-                for item in ranking:
-                    c = item.get("code")
-                    name = code_to_name.get(str(c)) or item.get("name") or c
-                    pos = item.get("position")
-                    is_anchor = c == anchor
 
-                    async def open_comp(e, target_code=c):
-                        page_state["active_code"] = target_code
-                        await navigate(f"/company/{target_code}")
+            def fact_card(row: dict[str, Any], result: dict[str, Any], ranked: bool = True):
+                code = row.get("code") or row.get("ts_code") or "未知代码"
+                rank: dict[str, Any] = (
+                    next((r for r in result["results"]["ranking"] if r.get("code") == code), {})
+                    if ranked
+                    else {}
+                )
+                status = disc_data.get("watch_statuses", {}).get(code)
+                status_text = {"observe": "观察", "research": "研究中", "paused": "已暂停"}.get(
+                    status, "未加入"
+                )
+                feedback = ft.Text("", size=13)
+                add_button = ft.Button("加入观察", disabled=not row.get("code"))
 
-                    rows_controls.append(
-                        ft.Container(
-                            padding=8,
-                            bgcolor=ft.Colors.AMBER_50 if is_anchor else ft.Colors.WHITE,
-                            border=ft.Border.all(1, ft.Colors.GREY_300),
-                            border_radius=4,
-                            content=ft.Row(
-                                controls=[
-                                    ft.Text(f"#{pos}", size=14, weight=ft.FontWeight.BOLD),
-                                    ft.Column(
-                                        [
-                                            ft.Text(
-                                                f"{name} ({c})", size=14, weight=ft.FontWeight.W_600
-                                            ),
-                                            ft.Text(
-                                                f"PB rank: {item.get('pb_rank')} | ROE rank: {item.get('roe_rank')} | 综合: {item.get('research_order')}",
-                                                size=12,
-                                                color=ft.Colors.GREY_700,
-                                            ),
-                                        ]
-                                    ),
-                                    ft.Button("查看", on_click=open_comp),
-                                ],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                async def open_comp(e):
+                    if gen == page_state["generation"] and actor.is_valid:
+                        await navigate(f"/company/{code}")
+
+                async def add_observation(e):
+                    if (
+                        gen != page_state["generation"]
+                        or not actor.is_valid
+                        or not page_state["connected"]
+                    ):
+                        return
+                    add_button.disabled = True
+                    page.update()
+                    try:
+                        await asyncio.to_thread(
+                            save_watch,
+                            actor,
+                            code,
+                            result["run_id"],
+                            {"status": "observe"},
+                            0,
+                            STATE_DIR,
+                            APP_MODE,
+                        )
+                        if (
+                            gen == page_state["generation"]
+                            and actor.is_valid
+                            and page_state["connected"]
+                        ):
+                            add_button.content = "查看我的研究"
+                            add_button.disabled = False
+                            add_button.on_click = open_comp
+                            feedback.value = "已加入观察；未自动标记已阅。已有记录不会被覆盖。"
+                            page.update()
+                    except (ServiceError, WorkspaceError, AuthError):
+                        if gen == page_state["generation"] and actor.is_valid:
+                            feedback.value = "加入未确认，请重试；重复加入不会覆盖原记录。"
+                            add_button.disabled = False
+                            page.update()
+
+                add_button.on_click = add_observation
+                annual = row.get("annual_roes") or []
+                reasons = row.get("exclusions") or row.get("eligibility_reasons") or []
+                return ft.Container(
+                    padding=12,
+                    bgcolor=ft.Colors.AMBER_50 if code == anchor else ft.Colors.WHITE,
+                    border=ft.Border.all(1, ft.Colors.GREY_300),
+                    border_radius=6,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                f"{row.get('name') or code} ({code})"
+                                + (" · 参照公司" if code == anchor else ""),
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
                             ),
+                            ft.Text(
+                                (
+                                    f"研究次序 {rank['position']}"
+                                    if rank.get("position")
+                                    else "未进入正式排名"
+                                )
+                                + f" · {status_text}"
+                            ),
+                            ft.Text(
+                                f"PB {fmt_number(row.get('pb'))} 倍 · ROE三年均值 {fmt_number(row.get('roe_mean'))}%",
+                                weight=ft.FontWeight.W_600,
+                            ),
+                            ft.Text(
+                                f"估值日：{row.get('valuation_date') or result.get('valuation_date') or '未记录'}",
+                                size=12,
+                            ),
+                            *[
+                                ft.Text(
+                                    f"{str(a.get('period') or '')[:4] or '年度未知'}年 ROE {fmt_number(a.get('roe_waa'))}%",
+                                    size=14,
+                                )
+                                for a in annual
+                            ],
+                            *([ft.Text("逐年ROE缺失，不补零")] if not annual else []),
+                            *(
+                                [
+                                    ft.Text(
+                                        "排除/缺口：" + exclusion_text(row),
+                                        color=ft.Colors.AMBER_900,
+                                    )
+                                ]
+                                if not rank and reasons and reasons != ["qualified"]
+                                else []
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Button(
+                                        "查看我的研究" if status else "查看", on_click=open_comp
+                                    ),
+                                    *([] if status else [add_button]),
+                                ],
+                                wrap=True,
+                            ),
+                            feedback,
+                        ],
+                        spacing=6,
+                    ),
+                )
+
+            def evidence(result: dict[str, Any]) -> list[ft.Control]:
+                scope = result.get("scope") or {}
+                rows = result.get("rows", [])
+                present_codes = {r.get("code") for r in rows}
+                missing = [c for c in scope.get("selected_codes", []) if c not in present_codes]
+                controls: list[ft.Control] = [
+                    *(
+                        [ft.Text("本次零合格候选；请核对业务排除与数据缺口，不改写为成功。")]
+                        if not result["results"]["ranking"]
+                        else []
+                    ),
+                    *(
+                        [ft.Text("本次无原关注池外合格对象，不生成新的正式前三。")]
+                        if result["results"].get("outside_watchlist_qualified_count") == 0
+                        else []
+                    ),
+                    ft.Text(
+                        f"行业：{scope.get('industry') or '未记录'} · 来源：{result.get('source')}"
+                    ),
+                    ft.Text(
+                        f"枚举 {scope.get('enumerated_count', '未记录')} 家 / 截取 {len(scope.get('selected_codes', []))} 家 / 合格 {len(result['results']['ranking'])} 家"
+                    ),
+                    ft.Text(
+                        "沪深主板、TuShare粗行业、按市值最多50家；偏向大市值，不是全行业或全市场。行业标签不能证明业务可比。"
+                    ),
+                    ft.Text(
+                        "缺少估值："
+                        + str(scope.get("excluded_missing_valuation") or "无记录")
+                        + "；超出上限："
+                        + str(scope.get("excluded_by_cap") or "无记录")
+                    ),
+                    ft.Text("已选但缺少公司行：" + ("、".join(missing) or "无")),
+                    ft.Text(
+                        "PB升序名次与三年ROE均值降序名次取平均，并列取平均名次；小分差不代表价值显著不同。"
+                    ),
+                    ft.Text(
+                        "低PB需核查资产质量；高ROE需核查杠杆、净资产及一次性收益；逐年值防止均值遮盖下行。均为待核查问题，不是已发现风险或买入建议。"
+                    ),
+                    ft.Text("\n".join(result.get("review_lines", []))),
+                ]
+                for row in rows:
+                    rank: dict[str, Any] = next(
+                        (
+                            r
+                            for r in result["results"]["ranking"]
+                            if r.get("code") == row.get("code")
+                        ),
+                        {},
+                    )
+                    annual = row.get("annual_roes") or []
+                    controls.extend(
+                        [
+                            ft.Text(
+                                f"{row.get('name') or row.get('code')} · {row.get('code')}",
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                            ft.Text(
+                                f"PB名次 {fmt_number(rank.get('pb_rank'), 1)} / ROE名次 {fmt_number(rank.get('roe_rank'), 1)} / 平均名次 {fmt_number(rank.get('research_order'), 1)}"
+                            ),
+                            ft.Text("排除/核查：" + exclusion_text(row)),
+                            ft.Text(
+                                f"估值来源 {row.get('valuation_source') or '未记录'} / 财务来源 {row.get('financial_source') or '未记录'} / 核查 {row.get('financial_checked_at') or '未记录'}"
+                            ),
+                            *[
+                                ft.Text(
+                                    f"{a.get('period')} · 公告 {a.get('ann_date') or '未记录'} · 版本 {a.get('update_flag', '未记录')} · 选择依据 {a.get('selection_basis') or '未记录'} · 取得 {a.get('acquired_at') or '未记录'}",
+                                    size=12,
+                                )
+                                for a in annual
+                            ],
+                        ]
+                    )
+                return controls
+
+            rows_controls: list[ft.Control] = []
+            attempt = disc_data.get("attempt")
+            if attempt:
+                rows_controls.append(
+                    ft.Text(
+                        f"本次尝试：{attempt['label']} · 目标数据日 {attempt.get('target_date') or '未知'}",
+                        weight=ft.FontWeight.BOLD,
+                    )
+                )
+                if attempt.get("error_summary"):
+                    rows_controls.append(ft.Text(attempt["error_summary"], color=ft.Colors.RED_700))
+                partial = attempt.get("result")
+                if partial and partial["health"] != "complete":
+                    rows_controls.append(
+                        ft.Text("本次部分完成，不作为正式前三；可得事实与缺口见诊断。")
+                    )
+                    rows_controls.append(
+                        section(
+                            "查看本次诊断",
+                            [
+                                *[fact_card(row, partial, ranked=False) for row in partial["rows"]],
+                                *evidence(partial),
+                            ],
                         )
                     )
+                if attempt.get("job_id"):
+
+                    async def open_attempt(e):
+                        await navigate(f"/jobs/{attempt['job_id']}")
+
+                    rows_controls.append(ft.Button("查看更新任务", on_click=open_attempt))
+            if disc_data.get("has_run"):
+                rows_controls.append(
+                    ft.Text(
+                        (
+                            "当前展示上次完整榜"
+                            if disc_data.get("showing_previous")
+                            else "当前完整榜"
+                        )
+                        + f" · 估值日 {disc_data['valuation_date']} · 扫描 {disc_data['captured_at']}",
+                        size=13,
+                    )
+                )
+                rows = {r.get("code") or r.get("ts_code"): r for r in disc_data["rows"]}
+                ranking = disc_data["results"]["ranking"]
+                date_sets = {r.get("valuation_date") for r in rows.values()}
+                year_sets = {
+                    tuple(
+                        sorted(str(a.get("period") or "")[:4] for a in (r.get("annual_roes") or []))
+                    )
+                    for r in rows.values()
+                }
+                if len(date_sets) > 1 or len(year_sets) > 1:
+                    rows_controls.append(
+                        ft.Text(
+                            "公司估值日或年报覆盖不同，请分别核对；差值不代表同口径优劣。",
+                            color=ft.Colors.AMBER_900,
+                        )
+                    )
+                top = disc_data["results"].get("top")
+                top = top if isinstance(top, list) else [r.get("code") for r in ranking[:3]]
+                featured = list(dict.fromkeys([*top, anchor]))
+                if not ranking:
+                    rows_controls.append(
+                        ft.Text("本次没有合格候选，请展开范围与排除原因；不代表全市场无机会。")
+                    )
+                if disc_data["results"].get("outside_watchlist_qualified_count") == 0:
+                    rows_controls.append(ft.Text("本次无原关注池外合格对象，不扩充研究前三。"))
+                rows_controls.extend(
+                    fact_card(rows.get(c) or {"code": c, "exclusions": ["缺少事实明细"]}, disc_data)
+                    for c in featured
+                )
+                rows_controls.append(section("展开依据、来源与排除原因", evidence(disc_data)))
+                rows_controls.append(
+                    section(
+                        "展开完整比较",
+                        [
+                            fact_card(rows.get(r.get("code")) or {"code": r.get("code")}, disc_data)
+                            for r in ranking
+                            if r.get("code") not in featured
+                        ],
+                    )
+                )
+            else:
+                rows_controls.append(ft.Text(disc_data.get("message") or "当前无可用完整榜。"))
 
             return ft.Column(
                 controls=[
@@ -485,8 +848,27 @@ def build_app():
                     ),
                     anchor_field,
                     ft.Text(
+                        "仅支持原关注参照；金融或行业未知不适用。",
+                        size=12,
+                    ),
+                    ft.Text(
+                        "研究次序不是买入建议；请比较实际指标并核查业务、资产与盈利质量。", size=13
+                    ),
+                    *(
+                        [ft.Text("正在查看指定任务的结果/诊断，并非后来最新资料。", size=12)]
+                        if job_id
+                        else []
+                    ),
+                    ft.Text(anchor_error, color=ft.Colors.RED_700)
+                    if anchor_error
+                    else ft.Container(),
+                    ft.Text(
                         f"参照标的：{anchor or '暂无'} (估值日: {disc_data.get('valuation_date', '无')})",
                         size=13,
+                    ),
+                    ft.Text(
+                        "提交将按当前原关注范围、已证明的上一交易日扫描；历史任务不变。",
+                        size=12,
                     ),
                     update_feedback,
                     ft.Divider(height=16),
@@ -509,6 +891,7 @@ def build_app():
                         else []
                     ),
                     ft.Column(controls=rows_controls, spacing=8),
+                    ft.Button("查看最新资料（不联网更新）", on_click=refresh_result),
                 ],
                 spacing=8,
             )
@@ -526,10 +909,26 @@ def build_app():
 
             status_text = ft.Text("")
 
+            async def open_result(e):
+                route = "/discover?" + urlencode({"anchor": job["anchor"], "job": job_id})
+                page_state.setdefault("discover_boards", {}).pop(route, None)
+                await navigate(route)
+
+            async def retry(e):
+                page_state["selected_anchor"] = job["anchor"]
+                page_state["pending_peer_request"] = None
+                await go_discover(e)
+
+            result_button = ft.Button("查看本次结果/诊断", on_click=open_result)
+            retry_button = ft.Button("重新扫描（先确认参照）", on_click=retry)
+
             def show_status(current: dict[str, Any]):
+                active = current["status"] in ("queued", "running")
+                result_button.visible = not active
+                retry_button.visible = not active
                 status_text.value = (
-                    f"状态：{current['status']} / {current['phase']} · "
-                    f"数据日：{current['target_date']}"
+                    f"状态：{job_status_label(current)} · 数据日：{current['target_date']}"
+                    + (" · 服务器已接收，可离开页面稍后回来。" if active else "")
                     + (f" · {current['error_summary']}" if current["error_summary"] else "")
                 )
 
@@ -572,7 +971,13 @@ def build_app():
                     ft.Text("更新任务", size=18, weight=ft.FontWeight.BOLD),
                     ft.Text(f"参照公司：{job['anchor']}"),
                     status_text,
-                    ft.Button("返回同业发现", on_click=go_discover),
+                    result_button,
+                    retry_button,
+                    ft.Text(
+                        "重新扫描须再次点击查找同业，按届时清单与已证明日历确定范围和目标日；不会更改原任务。",
+                        size=12,
+                    ),
+                    ft.Button("返回同业发现", on_click=retry),
                 ]
             )
 
@@ -681,6 +1086,8 @@ def build_app():
                 page.update()
 
             async def on_save(e):
+                if gen != page_state["generation"] or not page_state["connected"]:
+                    return
                 if not actor.is_valid:
                     feedback_text.value = "授权已失效，请重新登录"
                     feedback_text.color = ft.Colors.RED_700
@@ -710,6 +1117,12 @@ def build_app():
                         state_dir=STATE_DIR,
                         mode=APP_MODE,
                     )
+                    if (
+                        gen != page_state["generation"]
+                        or not actor.is_valid
+                        or not page_state["connected"]
+                    ):
+                        return
                     ctx["revision"] = updated["revision"]
                     ctx["is_watched"] = True
                     page_state["current_company_revision"] = updated["revision"]
@@ -725,7 +1138,20 @@ def build_app():
                     feedback_text.color = ft.Colors.RED_700
                 page.update()
 
+            page_state["save_current_form"] = on_save
+            comparison_pending = bool(
+                ctx.get("ack_run_id") and ctx["ack_run_id"] != ctx.get("displayed_run_id")
+            )
+
             async def on_ack(e):
+                if gen != page_state["generation"] or not page_state["connected"]:
+                    return
+                if comparison_pending:
+                    feedback_text.value = (
+                        "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存判断。"
+                    )
+                    page.update()
+                    return
                 if not actor.is_valid:
                     feedback_text.value = "授权已失效，请重新登录"
                     feedback_text.color = ft.Colors.RED_700
@@ -760,6 +1186,12 @@ def build_app():
                             state_dir=STATE_DIR,
                             mode=APP_MODE,
                         )
+                        if (
+                            gen != page_state["generation"]
+                            or not actor.is_valid
+                            or not page_state["connected"]
+                        ):
+                            return
                         ctx["revision"] = updated["revision"]
                         page_state["current_company_revision"] = updated["revision"]
                         feedback_text.value = f"已标记已阅 (版本: {updated['revision']})"
@@ -785,7 +1217,9 @@ def build_app():
             ack_btn = ft.Button(
                 "标记本次变化已阅",
                 on_click=on_ack,
-                disabled=conflict_detected or ctx.get("has_latest_attempt_gap", False),
+                disabled=comparison_pending
+                or conflict_detected
+                or ctx.get("has_latest_attempt_gap", False),
             )
 
             form_controls: list[ft.Control] = [
@@ -830,6 +1264,16 @@ def build_app():
                         spacing=8,
                     ),
                     feedback_text,
+                    *(
+                        [
+                            ft.Text(
+                                "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存判断。",
+                                color=ft.Colors.AMBER_900,
+                            )
+                        ]
+                        if comparison_pending
+                        else []
+                    ),
                 ]
             )
 
@@ -837,8 +1281,13 @@ def build_app():
                 controls=[
                     ft.Row(
                         controls=[
-                            ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回", on_click=go_home),
-                            ft.Text(f"{ctx['name']} ({code})", size=18, weight=ft.FontWeight.BOLD),
+                            ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回", on_click=go_back),
+                            ft.Text(
+                                f"{ctx['name']} ({code})",
+                                size=18,
+                                weight=ft.FontWeight.BOLD,
+                                expand=True,
+                            ),
                         ],
                         alignment=ft.MainAxisAlignment.START,
                     ),
@@ -888,13 +1337,14 @@ def build_app():
                         )
                     ),
                     ft.Card(
+                        semantic_container=False,
                         content=ft.Container(
                             padding=12,
                             content=ft.Column(
                                 controls=form_controls,
                                 spacing=8,
                             ),
-                        )
+                        ),
                     ),
                 ],
                 spacing=12,
@@ -925,7 +1375,17 @@ def build_app():
             actor: Actor | None = page_state.get("actor")
             if (not actor or not actor.is_valid) and page_state["route"] != "/login":
                 page_state["route"] = "/login"
-            route = page_state["route"]
+            route = urlparse(page_state["route"]).path
+            nav_bar.selected_index = (
+                1
+                if route == "/discover"
+                or route.startswith("/jobs/")
+                or (
+                    route.startswith("/company/")
+                    and page_state["company_return"].startswith("/discover")
+                )
+                else 0
+            )
             if route == "/login":
                 content = await render_login()
             elif route == "/":
@@ -943,13 +1403,16 @@ def build_app():
                 content = await render_login()
 
             if gen == page_state["generation"]:
+                if route != "/login" and (not actor or not actor.is_valid):
+                    page_state["route"] = "/login"
+                    content = await render_login()
                 content_container.content = content
 
         async def on_nav_change(e):
             if e.control.selected_index == 0:
                 await navigate("/")
             elif e.control.selected_index == 1:
-                await navigate("/discover")
+                await go_discover(e)
 
         nav_bar = ft.NavigationBar(
             destinations=[
@@ -1282,7 +1745,7 @@ def get_asgi_app():
     try:
         import flet.fastapi as flet_fastapi
 
-        inner_app = flet_fastapi.app(build_app())
+        inner_app = flet_fastapi.app(build_app(), assets_dir=str(Path(__file__).parent / "assets"))
     except ImportError:
 
         async def inner_app(scope, receive, send):

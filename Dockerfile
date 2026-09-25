@@ -17,6 +17,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # Copy application source code
 COPY app.py auth.py services.py workspace.py screen.py manage.py worker.py ./
 COPY tests/fixtures ./tests/fixtures
+COPY assets ./assets
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

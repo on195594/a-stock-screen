@@ -1739,3 +1739,144 @@ def test_discover_falls_back_from_damaged_complete_snapshot(tmp_path: Path) -> N
     disc = get_peer_discover(actor, "600001.SH", tmp_path, "demo")
     assert disc["has_run"] is False
     assert disc["error"] == "最新同业快照损坏或无法读取"
+
+
+def peer_view_run(state, run_id, snap, health="complete", day=22):
+    snap = {**snap, "data_date": f"2026-09-{day}", "screened_at": f"2026-09-{day}T16:00:00+08:00"}
+    raw = json.dumps(snap).encode()
+    rel = f"snapshots/{run_id}.json"
+    (state / "snapshots").mkdir(exist_ok=True)
+    (state / rel).write_bytes(raw)
+    with connect_workspace(state, "demo") as conn:
+        register_run(
+            conn,
+            run_id=run_id,
+            kind="peer",
+            anchor_code=snap.get("anchor", "600001.SH"),
+            rule_id="peer-screen-v1",
+            captured_at=f"2026-09-{day}T16:00:00+08:00",
+            valuation_date=f"2026-09-{day}",
+            health=health,
+            snapshot_path=rel,
+            snapshot_bytes=raw,
+        )
+    return run_id
+
+
+@pytest.mark.parametrize("has_old", [False, True])
+def test_discover_partial_is_diagnostic_not_new_top(tmp_path, has_old):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    old = (
+        import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+        if has_old
+        else None
+    )
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    snap["rows"] = [snap["rows"][0]]  # Three selected rows are absent.
+    snap["results"].update(
+        ranking=[], top=[], discovery_complete=False, outside_watchlist_qualified_count=0
+    )
+    partial = peer_view_run(tmp_path, "partial", snap, "partial")
+    data = get_peer_discover(actor, "600001.SH", tmp_path, "demo")
+    assert data["has_run"] is has_old
+    assert data["attempt"]["label"] == "部分完成"
+    assert data["attempt"]["result"]["run_id"] == partial
+    assert data["attempt"]["result"]["results"]["top"] == []
+    assert len(data["attempt"]["result"]["scope"]["selected_codes"]) == 4
+    if has_old:
+        assert data["run_id"] == old and data["showing_previous"]
+        assert data["results"]["top"] == ["600002.SH", "600001.SH", "600003.SH"]
+    else:
+        assert "暂无" in data["message"] and "results" not in data
+
+
+def test_discover_historical_job_pin_and_wrong_context(tmp_path):
+    from services import request_peer_update
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    first = peer_view_run(tmp_path, "first", snap, day=20)
+    later = peer_view_run(tmp_path, "later", snap, day=23)
+    job = request_peer_update(actor, "600001.SH", "old-job", tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        conn.execute(
+            "UPDATE update_jobs SET status='succeeded',phase='complete',finished_at=requested_at,result_run_id=? WHERE job_id=?",
+            (first, job["job_id"]),
+        )
+    historical = get_peer_discover(actor, "600001.SH", tmp_path, "demo", job_id=job["job_id"])
+    assert historical["run_id"] == first
+    assert historical["attempt"]["result"]["run_id"] == first
+    assert get_peer_discover(actor, "600001.SH", tmp_path, "demo")["run_id"] == later
+    assert get_peer_discover(actor, "600001.SH", tmp_path, "demo", run_id=first)["run_id"] == first
+    for options in ({"job_id": job["job_id"]}, {"run_id": first}):
+        with pytest.raises(ServiceError, match="不匹配"):
+            get_peer_discover(actor, "600002.SH", tmp_path, "demo", **options)
+    with connect_workspace(tmp_path, "demo") as conn:
+        conn.execute(
+            "UPDATE update_jobs SET status='failed',phase='failed',result_run_id=NULL,requested_at='2026-09-21T12:00:00+08:00' WHERE job_id=?",
+            (job["job_id"],),
+        )
+    failed = get_peer_discover(actor, "600001.SH", tmp_path, "demo", job_id=job["job_id"])
+    assert failed["run_id"] == first  # Not the run captured after this historical failure.
+    assert failed["attempt"]["label"] == "失败" and failed["showing_previous"]
+
+
+@pytest.mark.parametrize(
+    "status,label",
+    [("queued", "排队中"), ("running", "更新中"), ("failed", "失败"), ("interrupted", "已中断")],
+)
+def test_discover_job_without_run_is_not_no_candidates(tmp_path, status, label):
+    from services import request_peer_update
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    job = request_peer_update(actor, "600001.SH", "empty-job", tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        conn.execute(
+            "UPDATE update_jobs SET status=?,started_at=requested_at,finished_at=? WHERE job_id=?",
+            (
+                status,
+                None if status in ("queued", "running") else job["requested_at"],
+                job["job_id"],
+            ),
+        )
+    data = get_peer_discover(actor, "600001.SH", tmp_path, "demo")
+    assert not data["has_run"]
+    assert data["attempt"]["label"] == label and data["attempt"]["result"] is None
+    assert data["attempt"]["target_date"] == job["target_date"]
+
+
+def test_discover_preserves_anchor_facts_and_rechecks_authorization(tmp_path):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    snap["rows"][0]["exclusions"] = ["KNOWN_ST_WARNING"]
+    snap["results"]["ranking"] = [
+        r for r in snap["results"]["ranking"] if r["code"] != snap["anchor"]
+    ]
+    snap["results"]["top"] = [r["code"] for r in snap["results"]["ranking"]]
+    run_id = peer_view_run(tmp_path, "excluded-anchor", snap)
+    data = get_peer_discover(actor, snap["anchor"], tmp_path, "demo")
+    assert data["results"] == snap["results"]  # No reranking or promotion by personal state.
+    assert data["rows"][0]["pb"] == 1.85
+    assert data["rows"][0]["annual_roes"][0]["roe_waa"] == 12.5
+    saved = save_watch(
+        actor, "600002.SH", run_id, {"status": "paused", "reason": "私人判断"}, 0, tmp_path, "demo"
+    )
+    repeated = save_watch(actor, "600002.SH", run_id, {"status": "observe"}, 0, tmp_path, "demo")
+    assert repeated == saved and repeated["ack_run_id"] is None
+    data = get_peer_discover(actor, snap["anchor"], tmp_path, "demo")
+    assert data["watch_statuses"]["600002.SH"] == "paused"
+    assert "私人判断" not in str(data)
+    assert data["results"]["top"] == snap["results"]["top"]
+
+    def revoke_after_read(*args, **kwargs):
+        result = read_verified_snapshot(*args, **kwargs)
+        actor.revoke()
+        return result
+
+    with patch("services.read_verified_snapshot", side_effect=revoke_after_read):
+        with pytest.raises(AuthError):
+            get_peer_discover(actor, snap["anchor"], tmp_path, "demo")

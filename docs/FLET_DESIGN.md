@@ -3,7 +3,7 @@
 > 设计版本：1.1 · 2026-09-24 · 按用户任务重排交付优先级
 > 适用项目：`on195594/a-stock-screen`；本次代码审查基线 `9a78ff3`，附录中的旧提交仅作历史来源。
 > 使用者：所有者本人；主要终端：Web端，兼容移动端浏览器；部署：一台 Linux VPS。
-> 本文是目标合同，不是功能已完成或生产验收证明；实施差量见 [路线图](CODEX_IMPLEMENTATION.md)，代码布局见 [文档导航](README.md)。当前代码已有同业任务 worker、查询与个人记录，watch 更新及完整变化对照仍有缺口。沿用 Docker Compose + Nginx，不再把原拟 Caddy/systemd 当作待建资产；容器运行不等于本人 OAuth、真实更新或真机通过。本次只更新文档，不授权开发、联网或部署。
+> 本文是目标合同，不是功能已完成或生产验收证明；实施差量见 [路线图](CODEX_IMPLEMENTATION.md)，代码布局见 [文档导航](README.md)。当前代码已有同业任务 worker、查询与个人记录，watch 更新及完整变化对照仍有缺口。沿用 Docker Compose + Nginx，不再把原拟 Caddy/systemd 当作待建资产；容器运行不等于本人 OAuth、真实更新或真机通过。当前S1候选实现及验证见路线图；不授权真实数据联网或部署。
 
 ## 渐进式设计导引（Progressive Disclosure）
 

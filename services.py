@@ -14,7 +14,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from auth import Actor, check_actor
-from screen import ScreenError, normalize_flag, read_watchlist
+from screen import (
+    ScreenError,
+    annual_entries,
+    candidate_review_sections,
+    normalize_flag,
+    read_watchlist,
+)
 from workspace import (
     Mode,
     WorkspaceError,
@@ -689,70 +695,174 @@ def mark_seen(
         conn.close()
 
 
+def job_status_label(job: dict[str, Any]) -> str:
+    if job.get("status") == "succeeded":
+        return "部分完成" if job.get("phase") == "partial" else "完成"
+    return {"queued": "排队中", "running": "更新中", "failed": "失败", "interrupted": "已中断"}.get(
+        str(job.get("status")), "状态未知"
+    )
+
+
+def _peer_result(run: dict[str, Any], snap: dict[str, Any]) -> dict[str, Any]:
+    """Presentation facts only; never recompute eligibility or ranking."""
+    results = dict(snap["results"]) if isinstance(snap.get("results"), dict) else {}
+    # Report formatter uses period/roe_waa; historical synthetic fixtures used year/roe.
+    rows = [
+        {
+            **row,
+            "annual_roes": [
+                {
+                    **a,
+                    "period": a.get("period") or a.get("end_date") or str(a.get("year", "")),
+                    "roe_waa": a.get("roe_waa") if a.get("roe_waa") is not None else a.get("roe"),
+                }
+                for a in annual_entries(row)
+            ],
+        }
+        for row in safe_rows(snap)
+    ]
+    return {
+        "run_id": run["run_id"],
+        "valuation_date": run["valuation_date"],
+        "captured_at": run["captured_at"],
+        "health": run["health"],
+        "results": {**results, "ranking": safe_ranking(snap)},
+        "rows": rows,
+        "scope": snap.get("scope") or {},
+        "review_lines": candidate_review_sections({**snap, "rows": rows}),
+        "source": snap.get("source") or "未记录",
+        "limits": snap.get("limits") or {},
+    }
+
+
 def get_peer_discover(
     actor: Actor,
     anchor_code: str,
     state_dir: Path,
     mode: Mode,
+    *,
+    job_id: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Get peer screening results for an anchor company."""
+    """Keep a verified complete board separate from the attempt (or pinned job).
+
+    run_id pins the displayed board on return; job_id pins historical diagnostics.
+    Neither a partial result nor a later run may impersonate the requested result.
+    """
     check_actor(actor)
     conn = connect_workspace(state_dir, mode)
     try:
-        candidates = conn.execute(
-            """SELECT * FROM screen_runs
-            WHERE kind='peer' AND anchor_code=? AND health='complete'
-            ORDER BY valuation_date DESC, captured_at DESC, run_id DESC""",
-            (anchor_code,),
-        )
-        newest_damaged = None
-        for run in candidates:
-            try:
-                snap = read_verified_snapshot(
-                    state_dir, run["snapshot_path"], run["snapshot_sha256"]
-                )
-            except ServiceError as exc:
-                logger.warning("Skipping invalid peer snapshot for run %s: %s", run["run_id"], exc)
-                if newest_damaged is None:
-                    newest_damaged = run["run_id"]
-                continue
-            break
-        else:
-            if newest_damaged:
-                return {
-                    "has_run": False,
-                    "anchor_code": anchor_code,
-                    "error": "最新同业快照损坏或无法读取",
-                }
-            return {
-                "has_run": False,
-                "anchor_code": anchor_code,
-                "message": f"暂无参照公司 {anchor_code} 的完整同业筛选结果",
-            }
+        runs = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM screen_runs WHERE kind='peer' AND anchor_code=? "
+                "AND health IN ('complete','partial') ORDER BY captured_at DESC, run_id DESC",
+                (anchor_code,),
+            )
+        ]
+        job_row = conn.execute(
+            "SELECT * FROM update_jobs WHERE kind='peer' AND "
+            + ("job_id=?" if job_id else "json_extract(payload_json,'$.anchor')=?")
+            + " ORDER BY requested_at DESC, job_id DESC LIMIT 1",
+            (job_id or anchor_code,),
+        ).fetchone()
+        job = _job_summary(job_row) if job_row else None
+        if job_id and (not job or job["anchor"] != anchor_code):
+            raise ServiceError("任务与参照不匹配或任务不存在")
+        if run_id and not any(r["run_id"] == run_id and r["health"] == "complete" for r in runs):
+            raise ServiceError("指定完整榜不存在或与参照不匹配")
 
-        results_data: dict[str, Any] = (
-            dict(snap["results"])
-            if isinstance(snap, dict) and isinstance(snap.get("results"), dict)
-            else {}
+        result_run = next((r for r in runs if job and r["run_id"] == job["result_run_id"]), None)
+        latest = runs[0] if runs else None
+        # Imported observations newer than the last job are attempts too.
+        if not job_id and latest and job and latest["run_id"] != job["result_run_id"]:
+            if datetime.fromisoformat(latest["captured_at"]) > datetime.fromisoformat(
+                job["finished_at"] or job["requested_at"]
+            ):
+                job = None
+        attempt_run = result_run if job else latest
+        attempt = (
+            dict(job)
+            if job
+            else ({"status": "succeeded", "phase": attempt_run["health"]} if attempt_run else None)
         )
-        return {
-            "has_run": True,
-            "run_id": run["run_id"],
+        damaged: list[str] = []
+        cache: dict[str, dict[str, Any] | None] = {}
+
+        def load(run: dict[str, Any]) -> dict[str, Any] | None:
+            key = run["run_id"]
+            if key not in cache:
+                try:
+                    snap = read_verified_snapshot(
+                        state_dir, run["snapshot_path"], run["snapshot_sha256"]
+                    )
+                    if not isinstance(snap, dict):
+                        raise ServiceError("快照格式异常")
+                    cache[key] = _peer_result(run, snap)
+                except ServiceError:
+                    damaged.append(key)
+                    cache[key] = None
+            return cache[key]
+
+        if attempt is not None:
+            attempt["label"] = job_status_label(attempt)
+            attempt["result"] = load(attempt_run) if attempt_run else None
+            if attempt_run:
+                attempt["target_date"] = attempt_run["valuation_date"]
+            if attempt_run and not attempt["result"]:
+                attempt["error_summary"] = "快照损坏或无法读取"
+            if job and job["result_run_id"] and result_run is None:
+                attempt["error_summary"] = "任务结果不存在或与参照不匹配"
+
+        candidates = sorted(
+            (r for r in runs if r["health"] == "complete"),
+            key=lambda r: (r["valuation_date"] or "", r["captured_at"], r["run_id"]),
+            reverse=True,
+        )
+        if job_id:
+            assert job is not None  # Validated against anchor above.
+            # Historical jobs cannot silently open today's latest board.
+            if result_run and result_run["health"] == "complete":
+                candidates = [result_run]
+            else:
+                cutoff = datetime.fromisoformat(job["requested_at"])
+                candidates = [
+                    r for r in candidates if datetime.fromisoformat(r["captured_at"]) <= cutoff
+                ]
+        if run_id:
+            candidates = [r for r in candidates if r["run_id"] == run_id]
+        board = next((data for r in candidates if (data := load(r)) is not None), None)
+        out: dict[str, Any] = {
+            "has_run": board is not None,
             "anchor_code": anchor_code,
-            "valuation_date": run["valuation_date"],
-            "health": run["health"],
-            "warning": (
-                f"最新同业运行 ({newest_damaged}) 快照损坏，展示历史可用同业榜 "
-                f"(运行: {run['run_id']}, 估值日: {run['valuation_date']})"
-                if newest_damaged
-                else None
-            ),
-            "results": {
-                **results_data,
-                "ranking": safe_ranking(snap),
-            },
-            "rows": safe_rows(snap),
+            "attempt": attempt,
+            "watch_statuses": {it["code"]: it["status"] for it in list_watch_items(conn)},
+            "message": ""
+            if board
+            else f"暂无参照公司 {anchor_code} 的完整同业筛选结果；请选择允许的参照提交扫描，或查看本次诊断。",
         }
+        if board:
+            out.update(board)
+        if damaged:
+            out["warning" if board else "error"] = (
+                f"最新同业运行 ({damaged[0]}) 快照损坏，展示历史可用同业榜 "
+                f"(运行: {board['run_id']}, 估值日: {board['valuation_date']})"
+                if board
+                else "最新同业快照损坏或无法读取"
+            )
+        out["showing_previous"] = bool(
+            board
+            and attempt
+            and (not attempt.get("result") or attempt["result"]["run_id"] != board["run_id"])
+        )
+        if (
+            board
+            and attempt_run
+            and (attempt_run["valuation_date"] or "") < (board["valuation_date"] or "")
+        ):
+            out["warning"] = "本次估值日期倒退；当前完整榜仍为较新的可用资料。"
+        check_actor(actor)
+        return out
     finally:
         conn.close()
 

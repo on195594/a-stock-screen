@@ -267,6 +267,16 @@ def test_demo_origin_scheme_mismatch():
     assert s_lh._validate_origin("http://127.0.0.1:8550") is False
 
 
+def app_controls(control):
+    yield control
+    children = list(getattr(control, "controls", None) or [])
+    content = getattr(control, "content", None)
+    if isinstance(content, ft.Control):
+        children.append(content)
+    for child in children:
+        yield from app_controls(child)
+
+
 class AppMockPage:
     def __init__(self, auth=None):
         self.title = ""
@@ -282,6 +292,22 @@ class AppMockPage:
         self.navigation_bar = None
         self.updated_count = 0
         self.logged_out = False
+        self.views = [SimpleNamespace(on_scroll=None)]
+        self.route = "/"
+        self.scroll_offset = 0
+        self.dialog = None
+
+    def show_dialog(self, dialog):
+        self.dialog = dialog
+
+    def pop_dialog(self):
+        self.dialog = None
+
+    async def push_route(self, route):
+        self.route = route
+
+    async def scroll_to(self, *, offset, duration):
+        self.scroll_offset = offset
 
     def add(self, *controls):
         self.controls.extend(controls)
@@ -1006,12 +1032,126 @@ def test_discover_damaged_snapshot_shows_fallback_then_error(tmp_path, monkeypat
         page.navigation_bar.selected_index = 1
         await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
         disc = page.controls[0].controls[0].controls[0].content.controls[1].content
-        assert "最新同业运行 (latest) 快照损坏" in disc.controls[5].content.value
-        assert disc.controls[6].controls  # history ranking remains visible
+        text = "\n".join(str(c.value) for c in app_controls(disc) if isinstance(c, ft.Text))
+        assert "最新同业运行 (latest) 快照损坏" in text
+        assert "PB 1.85 倍" in text  # History facts, not just an empty ranking shell.
         old_path.unlink()
         await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
         disc = page.controls[0].controls[0].controls[0].content.controls[1].content
-        assert disc.controls[5].content.value == "最新同业快照损坏或无法读取"
-        assert disc.controls[6].controls == []
+        text = "\n".join(str(c.value) for c in app_controls(disc) if isinstance(c, ft.Text))
+        assert "最新同业快照损坏或无法读取" in text
+        assert "PB 1.85 倍" not in text
+
+    asyncio.run(check())
+
+
+def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    fixture = Path(__file__).parent / "tests/fixtures/peer_complete_v1.json"
+    first = import_snapshot(tmp_path, fixture, "demo")
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        content = page.controls[0].controls[0].controls[0].content.controls[1]
+
+        def controls():
+            return list(app_controls(content.content))
+
+        def button(label):
+            return next(c for c in controls() if isinstance(c, ft.Button) and c.content == label)
+
+        await button("开始同业研究").on_click(None)
+        discover_route = page.route
+        assert page.navigation_bar.selected_index == 1
+        texts = [str(c.value) for c in controls() if isinstance(c, ft.Text)]
+        assert sum("600001.SH) · 参照公司" in t for t in texts) == 1
+        assert any("2023年 ROE 12.50%" in t for t in texts)
+        assert any("ROE 均值差" in t for t in texts)
+        assert any("PB名次" in t for t in texts)
+        assert not any("PB rank" in t for t in texts)
+        await button("展开完整比较").on_click(None)
+        page.views[0].on_scroll(SimpleNamespace(pixels=320))
+        # Main order starts at company B. Joining is explicit and idempotent.
+        add = button("加入观察")
+        await add.on_click(None)
+        with connect_workspace(tmp_path, "demo") as conn:
+            saved = get_watch_item(conn, "600002.SH")
+        assert saved["ack_run_id"] is None
+        assert saved["added_run_id"] == first
+        await add.on_click(None)  # This button now opens existing research.
+        assert page.route == "/company/600002.SH"
+        assert page.navigation_bar.selected_index == 1
+        # New data arrives while a detail is open; returning must keep the old board.
+        import_snapshot(tmp_path, fixture.with_name("peer_second_change.json"), "demo")
+        back = next(c for c in controls() if isinstance(c, ft.IconButton) and c.tooltip == "返回")
+        await back.on_click(None)
+        assert page.route == discover_route and page.scroll_offset == 320
+        assert any("扫描 2026-09-20" in str(c.value) for c in controls() if isinstance(c, ft.Text))
+        full = next(
+            c
+            for c in controls()
+            if isinstance(c, ft.Column)
+            and c.controls
+            and isinstance(c.controls[0], ft.Button)
+            and c.controls[0].content == "展开完整比较"
+        )
+        assert full.controls[1].visible
+        # Browser navigation uses the same context, without a new submission.
+        await page.on_route_change(SimpleNamespace(route="/company/600002.SH"))
+        reason = next(c for c in controls() if isinstance(c, ft.TextField) and "理由" in c.label)
+        reason.value = "未保存草稿"
+        await page.on_route_change(SimpleNamespace(route=discover_route))
+        assert page.dialog is not None
+        await page.dialog.actions[0].on_click(None)  # Continue editing.
+        assert page.dialog is None and reason.value == "未保存草稿"
+        await page.on_route_change(SimpleNamespace(route=discover_route))
+        await page.dialog.actions[1].on_click(None)  # Explicit discard.
+        assert page.route == discover_route
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600002.SH")["reason"] == ""
+            assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 0
+        # A detached old add callback cannot write after navigation.
+        stale_add = button("加入观察")
+        page.navigation_bar.selected_index = 0
+        await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
+        await stale_add.on_click(None)
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert conn.execute("SELECT count(*) FROM watch_items").fetchone()[0] == 1
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
+def test_company_changed_ack_waits_for_real_comparison(tmp_path, monkeypatch):
+    from auth import create_demo_actor
+    from services import mark_seen, save_watch
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    fixture = Path(__file__).parent / "tests/fixtures/peer_complete_v1.json"
+    first = import_snapshot(tmp_path, fixture, "demo")
+    actor = create_demo_actor()
+    item = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    mark_seen(actor, "600001.SH", first, item["revision"], tmp_path, "demo")
+    import_snapshot(tmp_path, fixture.with_name("peer_second_change.json"), "demo")
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        controls = list(app_controls(page.controls[0]))
+        ack = next(
+            c for c in controls if isinstance(c, ft.Button) and c.content == "标记本次变化已阅"
+        )
+        assert ack.disabled
+        await ack.on_click(None)  # Server-side event guard even if a stale client fires it.
+        assert any("逐项对照尚未接入" in str(c.value) for c in controls if isinstance(c, ft.Text))
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH")["ack_run_id"] == first
+        await page.on_close(None)
 
     asyncio.run(check())

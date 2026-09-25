@@ -1,14 +1,20 @@
 """Mobile end-to-end browser smoke test with isolated temporary demo workspace."""
 
+import json
 import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
+
+from workspace import import_snapshot
 
 FIXTURES_DIR = Path(__file__).parent / "tests" / "fixtures"
 SCREENSHOT_PATH = Path("/tmp/mobile_test_failure.png")
@@ -36,7 +42,7 @@ def wait_for_server(url: str, timeout_sec: int = 15) -> bool:
 
 def main() -> int:
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import expect, sync_playwright
     except ImportError:
         print(
             "ERROR: playwright is not installed. Run `make setup` and `python3 -m playwright install chromium` first.",
@@ -52,7 +58,7 @@ def main() -> int:
     setup_cmd = [
         sys.executable,
         "manage.py",
-        "setup-demo",
+        "init",
         "--state-dir",
         str(state_dir),
         "--journal-mode",
@@ -112,7 +118,26 @@ def main() -> int:
                 viewport={"width": 390, "height": 844},
                 user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
             )
+            blocked_requests: list[str] = []
+
+            def local_only(route):
+                if urlparse(route.request.url).hostname in ("127.0.0.1", "localhost"):
+                    route.continue_()
+                else:
+                    blocked_requests.append(urlparse(route.request.url).hostname or "unknown")
+                    route.abort()
+
+            context.route("**/*", local_only)
             page = context.new_page()
+            local_fonts: list[int] = []
+            page.on(
+                "response",
+                lambda response: (
+                    local_fonts.append(response.status)
+                    if response.url.endswith("/fonts/NotoSansSC-Regular.otf")
+                    else None
+                ),
+            )
 
             def enable_accessibility():
                 page.wait_for_selector("flt-semantics-placeholder", timeout=15000)
@@ -159,19 +184,45 @@ def main() -> int:
                 page.locator("flt-semantics[role='button']").nth(1).click()
                 page.wait_for_selector("text=估值基准日", timeout=10000)
 
-                # 2. Click "同业发现" navigation item
-                discover_nav = page.locator("[aria-label='同业发现']").first
-                discover_nav.click()
-                page.wait_for_selector("text=参照标的", timeout=10000)
+                # U01: no snapshots or notes; no README/CLI import needed.
+                assert click_semantics_button("开始同业研究")
+                page.wait_for_selector("text=暂无参照公司", timeout=10000)
                 assert click_semantics_button("查找同业"), "Could not submit peer update"
                 page.wait_for_selector("text=更新任务", timeout=10000)
-                page.wait_for_selector("text=状态：succeeded / complete", timeout=20000)
-                assert click_semantics_button("返回同业发现"), "Could not return to discovery"
-                page.wait_for_selector("text=参照标的", timeout=10000)
+                page.wait_for_selector("text=状态：完成", timeout=20000)
+                page.get_by_role("button", name="查看本次结果/诊断", exact=True).click()
+                page.wait_for_selector("text=当前完整榜", timeout=10000)
+                result_url = page.url
+                assert "job=" in result_url
 
-                # 3. Click "查看" for company 600001.SH (index 1 in the list)
-                company_btn = page.locator("flt-semantics[role='button']:has-text('查看')").nth(1)
-                company_btn.click()
+                # Actual values and annual trend, not a shell/canvas or rank-only page.
+                for width in (360, 390, 430):
+                    page.set_viewport_size({"width": width, "height": 844})
+                    pb = page.get_by_text("PB 1.15 倍", exact=False).first
+                    pb.scroll_into_view_if_needed()
+                    assert pb.is_visible()
+                    bounds = pb.bounding_box()
+                    assert (
+                        bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
+                    )
+                    assert page.get_by_text("2025年 ROE 14.00%", exact=True).count() == 1
+                page.set_viewport_size({"width": 390, "height": 844})
+                page.get_by_role("button", name="展开依据、来源与排除原因", exact=True).click()
+                page.get_by_text(
+                    "沪深主板、TuShare粗行业", exact=False
+                ).scroll_into_view_if_needed()
+                assert page.get_by_text("最多50家", exact=False).is_visible()
+                assert page.get_by_text("与参照比较：", exact=False).count() >= 1
+                page.get_by_role("button", name="展开依据、来源与排除原因", exact=True).click()
+
+                # Add anchor directly; no automatic ack.
+                page.get_by_role("button", name="加入观察", exact=True).nth(1).click()
+                page.wait_for_selector("text=已加入观察", timeout=10000)
+                with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
+                    assert conn.execute(
+                        "SELECT ack_run_id FROM watch_items WHERE code='600001.SH'"
+                    ).fetchone() == (None,)
+                page.get_by_role("button", name="查看我的研究", exact=True).first.click()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
                 time.sleep(1)
 
@@ -182,40 +233,29 @@ def main() -> int:
                 reason_input.press_sequentially(test_reason)
                 time.sleep(1)
 
+                # Dirty browser Back must show a real modal, not silently lose the edit.
+                company_url = page.url
+                page.go_back()
+                unsaved_prompt = page.get_by_text("有未保存的研究记录", exact=True)
+                unsaved_prompt.wait_for(state="visible", timeout=10000)
+                page.get_by_role("button", name="继续编辑", exact=True).click()
+                unsaved_prompt.wait_for(state="hidden", timeout=10000)
+                expect(page).to_have_url(company_url)
+                expect(reason_input).to_have_value(test_reason)
+                assert reason_input.is_visible(), "Cancel did not keep the editor visible"
+
                 # 5. Verify Save button accessibility and interactive state via semantic locator
                 save_btn = page.locator("flt-semantics[role='button']:has-text('保存判断')").first
                 save_btn.scroll_into_view_if_needed()
                 assert save_btn.is_visible(), "Save button is not visible in accessibility tree"
                 assert save_btn.is_enabled(), "Save button is not enabled"
 
-                clicked = click_semantics_button("保存判断")
-                assert clicked, "Failed to click Save button"
+                save_btn.click()
 
-                # Await UI feedback or database confirmation
-                db_path = state_dir / "workspace.sqlite3"
-                saved_confirmed = False
-                for _ in range(25):
-                    has_ui_text = page.evaluate("""() => {
-                        const nodes = Array.from(document.querySelectorAll('flt-semantics, p, span, div'));
-                        return nodes.some(n => (n.innerText || n.textContent || n.getAttribute('aria-label') || '').includes('保存成功'));
-                    }""")
-                    if has_ui_text:
-                        saved_confirmed = True
-                        break
-                    if db_path.exists():
-                        conn = sqlite3.connect(db_path)
-                        r = conn.execute(
-                            "SELECT revision FROM watch_items WHERE code='600001.SH'"
-                        ).fetchone()
-                        conn.close()
-                        if r and r[0] >= 1:
-                            saved_confirmed = True
-                            break
-                    time.sleep(0.4)
+                # UI success is mandatory; persisted data must NEVER bypass this assertion.
+                page.get_by_text("保存成功", exact=False).wait_for(state="visible", timeout=10000)
 
-                assert saved_confirmed, "Save feedback or SQLite record not detected after save"
-
-                # 6. Verify SQLite persistence directly
+                # 6. Independently verify persistence, in addition to (not instead of) visible feedback
                 db_path = state_dir / "workspace.sqlite3"
                 conn = sqlite3.connect(db_path)
                 conn.row_factory = sqlite3.Row
@@ -227,6 +267,13 @@ def main() -> int:
                     f"Expected reason '{test_reason}', got '{row['reason']}'"
                 )
                 assert row["revision"] >= 1, "Revision should be >= 1"
+
+                # U03: real browser back preserves the task's anchor/result; never submits again.
+                page.go_back()
+                page.wait_for_selector("text=当前完整榜", timeout=10000)
+                assert page.url == result_url
+                page.get_by_role("button", name="查看我的研究", exact=True).first.click()
+                page.wait_for_selector("text=公司筛选事实", timeout=10000)
 
                 # 7. Navigate back to Home and verify persisted item on home list
                 home_nav = page.locator("[aria-label='我的研究']").first
@@ -241,7 +288,7 @@ def main() -> int:
                     '() => document.body.innerText.includes("查看详情")', timeout=10000
                 )
 
-                # 8. Reload page and assert persisted reason survives reload on home page
+                # 8. Reload returns to safe home; never replays a write/update.
                 page.reload()
                 page.wait_for_load_state("domcontentloaded")
                 enable_accessibility()
@@ -268,8 +315,33 @@ def main() -> int:
                 print(f"Detail reason input_value: '{val}'")
                 assert val == test_reason, f"Expected reason '{test_reason}', got '{val}'"
 
+                # Later partial synthetic observation must explain its gaps, not replace the old top.
+                partial = json.loads((FIXTURES_DIR / "peer_second_change.json").read_text())
+                partial["screened_at"] = datetime.now(UTC).isoformat()
+                partial["generated_at"] = partial["screened_at"]
+                partial_path = state_dir / "synthetic_partial.json"
+                partial_path.write_text(json.dumps(partial))
+                import_snapshot(state_dir, partial_path, "demo")
+                page.locator("[aria-label='同业发现']").first.click()
+                page.wait_for_selector("text=本次尝试：部分完成", timeout=10000)
+                page.wait_for_selector("text=当前展示上次完整榜", timeout=10000)
+                assert page.get_by_text("PB 1.85 倍", exact=False).count() == 1
+                page.get_by_role("button", name="查看本次诊断", exact=True).click()
+                page.get_by_text("PB 1.80 倍", exact=False).wait_for(state="visible", timeout=10000)
+                assert page.get_by_text("PB 1.80 倍", exact=False).count() == 1
+                assert 200 in local_fonts, "Chinese font was not loaded from local assets"
+                # Refresh revalidates/reads the selected result; it must not replay its job.
+                page.reload()
+                page.wait_for_load_state("domcontentloaded")
+                enable_accessibility()
+                page.wait_for_selector("text=本次尝试：部分完成", timeout=10000)
+                page.wait_for_selector("text=当前展示上次完整榜", timeout=10000)
+                with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
+                    assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
+                # Flet may attempt optional CDN resources; every external request was aborted.
+                print(f"External requests blocked (none allowed): {sorted(set(blocked_requests))}")
                 print(
-                    "Mobile browser end-to-end test passed: submit -> worker complete -> discover -> edit -> save -> DB check -> reload -> home check confirmed."
+                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> partial/old board."
                 )
                 return 0
             except Exception as exc:
@@ -279,6 +351,7 @@ def main() -> int:
                 except Exception:
                     pass
                 print(f"Mobile browser test assertion failed: {exc}", file=sys.stderr)
+                traceback.print_exc()
                 return 1
             finally:
                 context.close()

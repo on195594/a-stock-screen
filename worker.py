@@ -271,7 +271,15 @@ def _process(state_dir: Path, mode: Mode, tracker_root: Path | None, job: dict[s
         if _final_path(state_dir, job["job_id"]).is_file():
             # Preserve running for recovery after a crash between file and DB publication.
             raise WorkspaceError("final snapshot needs recovery") from None
-        _finish(state_dir, mode, job, None, "failed", "更新未完成，请核查数据来源并重试")
+        summary = "更新未完成，请核查数据来源并重试"
+        if isinstance(exc, ScreenError):
+            if str(exc).startswith("金融行业不适用 peer-screen-v1:"):
+                summary = "金融行业不适用于同业筛选，请改选非金融参照公司"
+            elif str(exc) == "参照公司行业不明":
+                summary = "参照公司行业不明，无法建立同业范围，请改选参照"
+            elif str(exc) == "参照公司不是当前沪深主板上市公司":
+                summary = "参照公司不在当前沪深主板范围，请改选参照"
+        _finish(state_dir, mode, job, None, "failed", summary)
 
 
 def run_worker(state_dir: Path, mode: Mode, tracker_root: Path | None, once: bool = False) -> None:

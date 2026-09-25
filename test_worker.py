@@ -213,3 +213,34 @@ def test_worker_refresh_does_not_promote_old_financial_cache(tmp_path: Path, mon
     assert failed_rows[0]["financial_checked_at"] is None
     assert "FINANCIAL_REQUEST_FAILED" in failed_rows[0]["exclusions"]
     assert "synthetic provider failure" not in str(failed_rows)
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        ("金融行业不适用 peer-screen-v1: secret-provider-value", "金融行业不适用"),
+        ("参照公司行业不明", "行业不明"),
+        ("参照公司不是当前沪深主板上市公司", "沪深主板"),
+        ("provider failed: secret-provider-value", "更新未完成"),
+    ],
+)
+def test_worker_business_failure_is_actionable_without_provider_text(
+    tmp_path, monkeypatch, error, expected
+):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    request_peer_update(actor, "600001.SH", "failure", tmp_path, "demo")
+    job = worker._claim(tmp_path, "demo")
+
+    def fail(*args, **kwargs):
+        raise ScreenError(error)
+
+    monkeypatch.setattr(worker, "build_live_snapshot", fail)
+    # Exercise only the production provider branch; all DB access stays in this synthetic workspace.
+    monkeypatch.setattr(
+        worker, "_finish", lambda state, mode, job, run, phase, message: messages.append(message)
+    )
+    messages = []
+    worker._process(tmp_path, "production", tmp_path, job)
+    assert expected in messages[0]
+    assert "secret-provider-value" not in messages[0]
