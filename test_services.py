@@ -13,11 +13,16 @@ from auth import AuthError, check_actor, create_demo_actor, create_owner_actor
 from services import (
     ServiceError,
     _annual_facts,
+    delete_watch,
+    dismiss_update_job,
     get_company_context,
     get_home,
     get_peer_discover,
+    get_update_job,
+    list_update_jobs,
     mark_seen,
     read_verified_snapshot,
+    request_peer_update,
     save_watch,
 )
 from workspace import (
@@ -1880,3 +1885,154 @@ def test_discover_preserves_anchor_facts_and_rechecks_authorization(tmp_path):
     with patch("services.read_verified_snapshot", side_effect=revoke_after_read):
         with pytest.raises(AuthError):
             get_peer_discover(actor, snap["anchor"], tmp_path, "demo")
+
+
+def test_delete_watch_preserves_facts_and_rejects_stale_readded_record(tmp_path):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    run = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    old = save_watch(actor, "600001.SH", run, {}, 0, tmp_path, "demo")
+    other = save_watch(actor, "600002.SH", run, {"reason": "保留"}, 0, tmp_path, "demo")
+    before = {p.name: p.read_bytes() for p in (tmp_path / "snapshots").rglob("*.json")}
+    with pytest.raises(ServiceError):
+        delete_watch(actor, old["code"], old["revision"] + 1, old["updated_at"], tmp_path, "demo")
+    delete_watch(actor, old["code"], old["revision"], old["updated_at"], tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert get_watch_item(conn, old["code"]) is None
+        assert get_watch_item(conn, other["code"]) == other
+        assert get_run(conn, run) is not None
+    new = save_watch(actor, old["code"], run, {}, 0, tmp_path, "demo")
+    assert new["revision"] == old["revision"] and new["updated_at"] != old["updated_at"]
+    assert new["reason"] == "" and new["ack_run_id"] is None
+    with pytest.raises(ServiceError):
+        delete_watch(actor, old["code"], old["revision"], old["updated_at"], tmp_path, "demo")
+    with pytest.raises(ServiceError):
+        save_watch(
+            actor,
+            old["code"],
+            run,
+            {"reason": "旧页覆盖"},
+            old["revision"],
+            tmp_path,
+            "demo",
+            expected_updated_at=old["updated_at"],
+        )
+    with pytest.raises(ServiceError):
+        mark_seen(
+            actor,
+            old["code"],
+            run,
+            old["revision"],
+            tmp_path,
+            "demo",
+            expected_updated_at=old["updated_at"],
+        )
+    acknowledged = mark_seen(
+        actor,
+        new["code"],
+        run,
+        new["revision"],
+        tmp_path,
+        "demo",
+        expected_updated_at=new["updated_at"],
+    )
+    assert (
+        mark_seen(
+            actor,
+            new["code"],
+            run,
+            new["revision"],
+            tmp_path,
+            "demo",
+            expected_updated_at=new["updated_at"],
+        )
+        == acknowledged
+    )
+    assert before and before == {
+        p.name: p.read_bytes() for p in (tmp_path / "snapshots").rglob("*.json")
+    }
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "succeeded", "failed", "interrupted"])
+def test_dismiss_job_preserves_request_id_and_alias_deduplication(tmp_path, status):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    run = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    job = request_peer_update(actor, "600001.SH", "original", tmp_path, "demo")
+    assert (
+        request_peer_update(actor, "600001.SH", "alias", tmp_path, "demo")["job_id"]
+        == job["job_id"]
+    )
+    with connect_workspace(tmp_path, "demo") as conn:
+        conn.execute(
+            "UPDATE update_jobs SET status=?, started_at=requested_at, finished_at=?, result_run_id=? WHERE job_id=?",
+            (
+                status,
+                None if status in ("queued", "running") else job["requested_at"],
+                run if status == "succeeded" else None,
+                job["job_id"],
+            ),
+        )
+    if status in ("failed", "interrupted"):
+        dismiss_update_job(actor, job["job_id"], tmp_path, "demo")
+        dismiss_update_job(actor, job["job_id"], tmp_path, "demo")
+        assert list_update_jobs(actor, tmp_path, "demo") == []
+        with pytest.raises(ServiceError):
+            get_update_job(actor, job["job_id"], tmp_path, "demo")
+        with pytest.raises(ServiceError):
+            get_peer_discover(actor, "600001.SH", tmp_path, "demo", job_id=job["job_id"])
+        assert (
+            get_peer_discover(actor, "600001.SH", tmp_path, "demo")["attempt"].get("job_id") is None
+        )
+    else:
+        with pytest.raises(ServiceError):
+            dismiss_update_job(actor, job["job_id"], tmp_path, "demo")
+        assert len(list_update_jobs(actor, tmp_path, "demo")) == 1
+    for request_id in ("original", "alias"):
+        assert (
+            request_peer_update(actor, "600001.SH", request_id, tmp_path, "demo")["job_id"]
+            == job["job_id"]
+        )
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
+        assert get_run(conn, run) is not None
+
+
+@pytest.mark.parametrize("operation", ["watch", "job"])
+@pytest.mark.parametrize("revoke_at", [1, 2, 3])
+def test_removal_authorization_and_rollback(tmp_path, monkeypatch, operation, revoke_at):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    run = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    item = save_watch(actor, "600001.SH", run, {"reason": "不可丢失"}, 0, tmp_path, "demo")
+    job = request_peer_update(actor, "600001.SH", "remove-auth", tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        conn.execute(
+            "UPDATE update_jobs SET status='failed', finished_at=requested_at WHERE job_id=?",
+            (job["job_id"],),
+        )
+    calls = 0
+
+    def recheck(current):
+        nonlocal calls
+        calls += 1
+        if calls == revoke_at:
+            current.revoke()
+        return check_actor(current)
+
+    monkeypatch.setattr("services.check_actor", recheck)
+    with pytest.raises(AuthError):
+        if operation == "watch":
+            delete_watch(
+                actor, item["code"], item["revision"], item["updated_at"], tmp_path, "demo"
+            )
+        else:
+            dismiss_update_job(actor, job["job_id"], tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert get_watch_item(conn, item["code"]) == item
+        assert (
+            conn.execute(
+                "SELECT phase FROM update_jobs WHERE job_id=?", (job["job_id"],)
+            ).fetchone()[0]
+            != "dismissed"
+        )

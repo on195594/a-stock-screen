@@ -491,6 +491,7 @@ def get_company_context(
             "is_watched": watch_item is not None,
             "watch_status": watch_item.get("status") if watch_item else None,
             "revision": watch_item.get("revision") if watch_item else 0,
+            "updated_at": watch_item.get("updated_at") if watch_item else None,
             "ack_run_id": watch_item.get("ack_run_id") if watch_item else None,
             "displayed_run_id": usable_fact_run.get("run_id") if usable_fact_run else None,
             "usable_fact": usable_fact_data,
@@ -542,6 +543,8 @@ def save_watch(
     expected_revision: int,
     state_dir: Path,
     mode: Mode,
+    *,
+    expected_updated_at: str | None = None,
 ) -> dict[str, Any]:
     """Add a new company or update personal research notes with revision checking."""
     check_actor(actor)
@@ -636,6 +639,11 @@ def save_watch(
                     conn.commit()
                     return dict(existing)
 
+                if (
+                    expected_updated_at is not None
+                    and existing["updated_at"] != expected_updated_at
+                ):
+                    raise ServiceError("记录已变化或已删除后重新加入，请刷新后重试")
                 save_watch_item(
                     conn,
                     code=code,
@@ -666,6 +674,8 @@ def mark_seen(
     expected_revision: int,
     state_dir: Path,
     mode: Mode,
+    *,
+    expected_updated_at: str | None = None,
 ) -> dict[str, Any]:
     """Mark changes seen up to the currently displayed run."""
     check_actor(actor)
@@ -675,6 +685,13 @@ def mark_seen(
         conn.execute("BEGIN IMMEDIATE;")
         try:
             check_actor(actor)
+            if expected_updated_at is not None:
+                item = get_watch_item(conn, code)
+                if not item or (
+                    item["updated_at"] != expected_updated_at
+                    and item["ack_run_id"] != displayed_run_id
+                ):
+                    raise ServiceError("记录已变化或已删除后重新加入，请刷新后重试")
             mark_watch_ack(
                 conn,
                 code=code,
@@ -691,6 +708,53 @@ def mark_seen(
             raise
     except WorkspaceError as exc:
         raise ServiceError(str(exc)) from exc
+    finally:
+        conn.close()
+
+
+def delete_watch(
+    actor: Actor,
+    code: str,
+    expected_revision: int,
+    expected_updated_at: str,
+    state_dir: Path,
+    mode: Mode,
+) -> None:
+    """Delete only personal state; shared immutable observations remain untouched."""
+    check_actor(actor)
+    conn = connect_workspace(state_dir, mode)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        check_actor(actor)
+        removed = conn.execute(
+            "DELETE FROM watch_items WHERE code=? AND revision=? AND updated_at=?",
+            (code, expected_revision, expected_updated_at),
+        )
+        if removed.rowcount != 1:
+            raise ServiceError("记录已变化或已删除，请刷新后重试")
+        check_actor(actor)
+        conn.commit()
+    finally:
+        # Closing an uncommitted connection rolls back, including revoked authorization.
+        conn.close()
+
+
+def dismiss_update_job(actor: Actor, job_id: str, state_dir: Path, mode: Mode) -> None:
+    """Hide terminal failures, retaining request IDs so retries cannot trigger new work."""
+    check_actor(actor)
+    conn = connect_workspace(state_dir, mode)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        check_actor(actor)
+        changed = conn.execute(
+            "UPDATE update_jobs SET phase='dismissed' WHERE job_id=? "
+            "AND status IN ('failed','interrupted') AND result_run_id IS NULL",
+            (job_id,),
+        )
+        if changed.rowcount != 1:
+            raise ServiceError("只能清理失败或中断且无结果的任务")
+        check_actor(actor)
+        conn.commit()
     finally:
         conn.close()
 
@@ -761,7 +825,7 @@ def get_peer_discover(
             )
         ]
         job_row = conn.execute(
-            "SELECT * FROM update_jobs WHERE kind='peer' AND "
+            "SELECT * FROM update_jobs WHERE kind='peer' AND phase!='dismissed' AND "
             + ("job_id=?" if job_id else "json_extract(payload_json,'$.anchor')=?")
             + " ORDER BY requested_at DESC, job_id DESC LIMIT 1",
             (job_id or anchor_code,),
@@ -1022,7 +1086,7 @@ def list_update_jobs(actor: Actor, state_dir: Path, mode: Mode) -> list[dict[str
     conn = connect_workspace(state_dir, mode)
     try:
         rows = conn.execute(
-            "SELECT * FROM update_jobs ORDER BY requested_at DESC LIMIT 20"
+            "SELECT * FROM update_jobs WHERE phase!='dismissed' ORDER BY requested_at DESC LIMIT 20"
         ).fetchall()
         check_actor(actor)
         return [_job_summary(row) for row in rows]
@@ -1036,8 +1100,8 @@ def get_update_job(actor: Actor, job_id: str, state_dir: Path, mode: Mode) -> di
     try:
         row = conn.execute("SELECT * FROM update_jobs WHERE job_id=?", (job_id,)).fetchone()
         check_actor(actor)
-        if row is None:
-            raise ServiceError("更新任务不存在")
+        if row is None or row["phase"] == "dismissed":
+            raise ServiceError("更新任务不存在或已清理")
         return _job_summary(row)
     finally:
         conn.close()

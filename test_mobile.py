@@ -338,10 +338,78 @@ def main() -> int:
                 page.wait_for_selector("text=当前展示上次完整榜", timeout=10000)
                 with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
                     assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
+                # Real confirmation/cancellation and visible deletion feedback, not DB fallbacks.
+                page.locator("[aria-label='我的研究']").first.click()
+                page.get_by_role("button", name="查看详情", exact=True).first.click()
+                removal_reason = page.locator("textarea[aria-label*='理由']").first
+                removal_reason.click()  # Flutter syncs the editing value when focused.
+                expect(removal_reason).to_have_value(test_reason)
+                removal_reason.press("End")
+                removal_reason.press_sequentially("（未保存）")
+                page.get_by_role("button", name="删除个人研究记录", exact=True).click()
+                page.get_by_role("button", name="取消", exact=True).click()
+                removal_reason.click()
+                expect(removal_reason).to_have_value(test_reason + "（未保存）")
+                page.get_by_role("button", name="删除个人研究记录", exact=True).click()
+                page.get_by_role("button", name="确认操作", exact=True).click()
+                page.get_by_text("已删除个人研究记录，历史扫描保留。", exact=True).wait_for(
+                    state="visible"
+                )
+                page.get_by_text("关注清单 (0)", exact=True).wait_for(state="visible")
+                with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
+                    assert conn.execute("SELECT count(*) FROM watch_items").fetchone()[0] == 0
+                    assert conn.execute("SELECT count(*) FROM screen_runs").fetchone()[0] == 2
+                # Immutable results remain available, and re-adding does not restore old notes/ack.
+                page.goto(company_url)
+                page.wait_for_load_state("domcontentloaded")
+                enable_accessibility()
+                page.wait_for_selector("text=公司筛选事实", timeout=10000)
+                fresh_reason = page.locator("textarea[aria-label*='理由']").first
+                fresh_reason.click()
+                expect(fresh_reason).to_have_value("")
+                page.get_by_role("button", name="保存判断", exact=True).click()
+                page.get_by_text("保存成功", exact=False).wait_for(state="visible")
+                with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
+                    assert conn.execute(
+                        "SELECT reason,ack_run_id FROM watch_items WHERE code='600001.SH'"
+                    ).fetchone() == ("", None)
+                    # Synthetic terminal failure, inserted atomically; worker never receives it.
+                    conn.execute("""INSERT INTO update_jobs
+                        (job_id,request_id,kind,payload_json,dedupe_key,status,phase,requested_at,updated_at,finished_at)
+                        SELECT 'synthetic-failure','synthetic-failure',kind,payload_json,dedupe_key,
+                        'failed','failed',requested_at,updated_at,updated_at FROM update_jobs LIMIT 1""")
+                    target_date = json.loads(
+                        conn.execute(
+                            "SELECT payload_json FROM update_jobs WHERE job_id='synthetic-failure'"
+                        ).fetchone()[0]
+                    )["target_date"]
+                page.locator("[aria-label='我的研究']").first.click()
+                failed_label = f"600001.SH · {target_date} · 失败"
+                page.get_by_role("button", name=failed_label, exact=True).click()
+                page.get_by_role("button", name="清理失败任务", exact=True).click()
+                page.get_by_role("button", name="取消", exact=True).click()
+                page.get_by_role("button", name="清理失败任务", exact=True).click()
+                page.get_by_role("button", name="确认操作", exact=True).click()
+                page.get_by_text("已从列表清理失败任务，防重放记录保留。", exact=True).wait_for(
+                    state="visible"
+                )
+                expect(page.get_by_role("button", name=failed_label, exact=True)).to_have_count(0)
+                page.reload()
+                page.wait_for_load_state("domcontentloaded")
+                enable_accessibility()
+                page.get_by_text("关注清单 (1)", exact=True).wait_for(state="visible")
+                expect(page.get_by_role("button", name=failed_label, exact=True)).to_have_count(0)
+                with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
+                    assert (
+                        conn.execute(
+                            "SELECT phase FROM update_jobs WHERE job_id='synthetic-failure'"
+                        ).fetchone()[0]
+                        == "dismissed"
+                    )
                 # Flet may attempt optional CDN resources; every external request was aborted.
                 print(f"External requests blocked (none allowed): {sorted(set(blocked_requests))}")
                 print(
-                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> partial/old board."
+                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> partial/old board -> delete/cancel/re-add -> dismiss failure/reload."
                 )
                 return 0
             except Exception as exc:

@@ -19,6 +19,8 @@ from auth import (
 from screen import fmt_number
 from services import (
     ServiceError,
+    delete_watch,
+    dismiss_update_job,
     get_company_context,
     get_home,
     get_peer_discover,
@@ -95,6 +97,8 @@ def build_app():
         login_msg = ft.Text("", size=13, color=ft.Colors.RED_700)
 
         async def navigate(route: str, *, from_browser: bool = False):
+            if page_state.pop("removal_dialog", False):
+                page.pop_dialog()
             getter = page_state.get("current_form_getter")
             actor = page_state.get("actor")
             if (
@@ -255,6 +259,68 @@ def build_app():
             page.update()
             await navigate("/login")
 
+        def removal_button(label, message, operation, gen, actor, *, code=None):
+            def live():
+                return (
+                    gen == page_state["generation"] and actor.is_valid and page_state["connected"]
+                )
+
+            async def ask(e):
+                if not live():
+                    return
+                feedback = ft.Text("", color=ft.Colors.RED_700)
+                busy = False
+                closed = False
+
+                async def cancel(e):
+                    nonlocal closed
+                    if live() and not busy:
+                        closed = True
+                        page_state.pop("removal_dialog", None)
+                        page.pop_dialog()
+
+                async def confirm(e):
+                    nonlocal busy, closed
+                    if not live() or busy or closed:
+                        return
+                    busy = True
+                    closed = True
+                    try:
+                        await asyncio.to_thread(operation)
+                    except Exception:
+                        if live():
+                            feedback.value = "操作未确认：记录可能已变化或授权失效，请返回后重新查看；不会自动重试。"
+                            page.update()
+                        return
+                    finally:
+                        busy = False
+                    if not live():
+                        return
+                    if code:
+                        page_state["drafts"].pop(code, None)
+                        page_state["current_form_getter"] = None
+                    page_state["notice"] = (
+                        "已删除个人研究记录，历史扫描保留。"
+                        if code
+                        else "已从列表清理失败任务，防重放记录保留。"
+                    )
+                    await navigate("/")
+
+                page_state["removal_dialog"] = True
+                page.show_dialog(
+                    ft.AlertDialog(
+                        modal=True,
+                        title=ft.Text(label),
+                        content=ft.Column([ft.Text(message), feedback], tight=True),
+                        actions=[
+                            ft.TextButton("取消", on_click=cancel),
+                            ft.TextButton("确认操作", on_click=confirm),
+                        ],
+                    )
+                )
+
+            return ft.Button(label, on_click=ask)
+
         # --- Views ---
         async def render_login():
             async def trigger_login(e):
@@ -406,6 +472,7 @@ def build_app():
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         ),
                     ),
+                    ft.Text(page_state.pop("notice", ""), color=ft.Colors.GREEN_700),
                     ft.Text("固定关注更新尚未接入；同业扫描不会替代关注清单更新。", size=13),
                     ft.Button(
                         "开始同业研究" if not data["total_watch_count"] else "前往同业扫描",
@@ -919,11 +986,19 @@ def build_app():
                 page_state["pending_peer_request"] = None
                 await go_discover(e)
 
+            remove_button = removal_button(
+                "清理失败任务",
+                "仅从列表移除此失败或中断任务，保留请求编号以防旧请求重新执行；不删除历史快照，也不会重试更新。",
+                lambda: dismiss_update_job(actor, job_id, STATE_DIR, APP_MODE),
+                gen,
+                actor,
+            )
             result_button = ft.Button("查看本次结果/诊断", on_click=open_result)
             retry_button = ft.Button("重新扫描（先确认参照）", on_click=retry)
 
             def show_status(current: dict[str, Any]):
                 active = current["status"] in ("queued", "running")
+                remove_button.visible = current["status"] in ("failed", "interrupted")
                 result_button.visible = not active
                 retry_button.visible = not active
                 status_text.value = (
@@ -973,6 +1048,7 @@ def build_app():
                     status_text,
                     result_button,
                     retry_button,
+                    remove_button,
                     ft.Text(
                         "重新扫描须再次点击查找同业，按届时清单与已证明日历确定范围和目标日；不会更改原任务。",
                         size=12,
@@ -994,6 +1070,7 @@ def build_app():
 
             page_state["current_company_code"] = code
             page_state["current_company_revision"] = ctx.get("revision", 0)
+            page_state["current_company_updated_at"] = ctx.get("updated_at")
             persisted_baseline = {
                 "watch_status": str(ctx.get("watch_status") or "observe"),
                 "reason": str(ctx.get("reason") or ""),
@@ -1007,7 +1084,10 @@ def build_app():
             draft_base_rev = None
             if draft:
                 draft_base_rev = draft.get("_base_revision")
-                if draft_base_rev is not None and draft_base_rev != ctx.get("revision", 0):
+                if (draft_base_rev is not None and draft_base_rev != ctx.get("revision", 0)) or (
+                    "_base_updated_at" in draft
+                    and draft["_base_updated_at"] != ctx.get("updated_at")
+                ):
                     conflict_detected = True
 
             status_val = draft.get("watch_status") or ctx["watch_status"] or "observe"
@@ -1062,13 +1142,20 @@ def build_app():
                     else page_state.get("current_company_revision", ctx.get("revision", 0))
                 )
                 current_rev = page_state.get("current_company_revision", ctx.get("revision", 0))
-                is_conflict = existing_base is not None and existing_base != current_rev
+                is_conflict = (existing_base is not None and existing_base != current_rev) or bool(
+                    existing_draft
+                    and "_base_updated_at" in existing_draft
+                    and existing_draft["_base_updated_at"] != ctx.get("updated_at")
+                )
                 is_modified = current != page_state.get("current_form_baseline")
 
                 if is_modified or is_conflict:
                     page_state.setdefault("drafts", {})[code] = {
                         **current,
                         "_base_revision": base_rev,
+                        "_base_updated_at": existing_draft.get("_base_updated_at")
+                        if existing_draft
+                        else ctx.get("updated_at"),
                     }
                 else:
                     page_state.setdefault("drafts", {}).pop(code, None)
@@ -1114,6 +1201,7 @@ def build_app():
                         source_run_id=ctx.get("displayed_run_id") or "run_initial",
                         fields=fields,
                         expected_revision=ctx["revision"],
+                        expected_updated_at=ctx.get("updated_at"),
                         state_dir=STATE_DIR,
                         mode=APP_MODE,
                     )
@@ -1125,6 +1213,9 @@ def build_app():
                         return
                     ctx["revision"] = updated["revision"]
                     ctx["is_watched"] = True
+                    ctx["updated_at"] = updated["updated_at"]
+                    page_state["current_company_updated_at"] = updated["updated_at"]
+                    delete_btn.visible = True
                     page_state["current_company_revision"] = updated["revision"]
                     page_state["current_form_baseline"] = get_current_form()
                     page_state.setdefault("drafts", {}).pop(code, None)
@@ -1183,6 +1274,7 @@ def build_app():
                             code=code,
                             displayed_run_id=disp_run,
                             expected_revision=ctx["revision"],
+                            expected_updated_at=ctx.get("updated_at"),
                             state_dir=STATE_DIR,
                             mode=APP_MODE,
                         )
@@ -1193,6 +1285,8 @@ def build_app():
                         ):
                             return
                         ctx["revision"] = updated["revision"]
+                        ctx["updated_at"] = updated["updated_at"]
+                        page_state["current_company_updated_at"] = updated["updated_at"]
                         page_state["current_company_revision"] = updated["revision"]
                         feedback_text.value = f"已标记已阅 (版本: {updated['revision']})"
                         feedback_text.color = ft.Colors.GREEN_700
@@ -1213,6 +1307,17 @@ def build_app():
                 for r in annual_roes
             ]
 
+            delete_btn = removal_button(
+                "删除个人研究记录",
+                f"确认删除 {ctx['name']}（{code}）的个人研究记录？理由、下一步、笔记链接、已阅状态和本页草稿将被移除，不能撤销。历史扫描及外部笔记原文不受影响；再次加入会从空记录开始。",
+                lambda: delete_watch(
+                    actor, code, ctx["revision"], ctx["updated_at"], STATE_DIR, APP_MODE
+                ),
+                gen,
+                actor,
+                code=code,
+            )
+            delete_btn.visible = ctx["is_watched"]
             save_btn = ft.Button("保存判断", on_click=on_save, disabled=conflict_detected)
             ack_btn = ft.Button(
                 "标记本次变化已阅",
@@ -1264,6 +1369,7 @@ def build_app():
                         spacing=8,
                     ),
                     feedback_text,
+                    delete_btn,
                     *(
                         [
                             ft.Text(
@@ -1504,7 +1610,12 @@ def build_app():
                 existing_base = existing_draft.get("_base_revision") if existing_draft else None
                 current_rev = page_state.get("current_company_revision", 0)
                 base_rev = existing_base if existing_base is not None else current_rev
-                is_conflict = existing_base is not None and existing_base != current_rev
+                is_conflict = (existing_base is not None and existing_base != current_rev) or bool(
+                    existing_draft
+                    and "_base_updated_at" in existing_draft
+                    and existing_draft["_base_updated_at"]
+                    != page_state.get("current_company_updated_at")
+                )
                 try:
                     curr = page_state["current_form_getter"]()
                     is_modified = baseline is not None and curr != baseline
@@ -1512,6 +1623,9 @@ def build_app():
                         page_state.setdefault("drafts", {})[active_c] = {
                             **curr,
                             "_base_revision": base_rev,
+                            "_base_updated_at": existing_draft.get("_base_updated_at")
+                            if existing_draft
+                            else page_state.get("current_company_updated_at"),
                         }
                     else:
                         page_state.setdefault("drafts", {}).pop(active_c, None)

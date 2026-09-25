@@ -1155,3 +1155,83 @@ def test_company_changed_ack_waits_for_real_comparison(tmp_path, monkeypatch):
         await page.on_close(None)
 
     asyncio.run(check())
+
+
+def test_removal_dialog_cancel_conflict_navigation_and_readd(tmp_path, monkeypatch):
+    from auth import create_demo_actor
+    from services import save_watch
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    run = import_snapshot(
+        tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
+    )
+    actor = create_demo_actor()
+    item = save_watch(actor, "600001.SH", run, {}, 0, tmp_path, "demo")
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+
+        def button(label):
+            return next(
+                c
+                for c in app_controls(page.controls[0])
+                if isinstance(c, ft.Button) and c.content == label
+            )
+
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        delete = button("删除个人研究记录")
+        await delete.on_click(None)
+        cancelled_confirm = page.dialog.actions[1]
+        await page.dialog.actions[0].on_click(None)
+        await cancelled_confirm.on_click(None)
+        assert page.dialog is None
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH") == item
+        # Another tab's save makes this confirmation stale, without losing either record.
+        save_watch(
+            actor, "600001.SH", run, {"reason": "新判断"}, item["revision"], tmp_path, "demo"
+        )
+        await delete.on_click(None)
+        await page.dialog.actions[1].on_click(None)
+        assert any(
+            "操作未确认" in str(c.value)
+            for c in app_controls(page.dialog)
+            if isinstance(c, ft.Text)
+        )
+        await page.dialog.actions[0].on_click(None)
+        await page.on_route_change(SimpleNamespace(route="/"))
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        await button("删除个人研究记录").on_click(None)
+        stale_confirm = page.dialog.actions[1]
+        await page.on_route_change(SimpleNamespace(route="/"))
+        await stale_confirm.on_click(None)
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH")["reason"] == "新判断"
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        await button("删除个人研究记录").on_click(None)
+        await page.dialog.actions[1].on_click(None)
+        assert page.route == "/" and page.dialog is None
+        assert any(
+            "已删除个人研究记录" in str(c.value)
+            for c in app_controls(page.controls[0])
+            if isinstance(c, ft.Text)
+        )
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH") is None
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        assert not button("删除个人研究记录").visible
+        await button("保存判断").on_click(None)
+        assert button("删除个人研究记录").visible
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH")["reason"] == ""
+        await button("删除个人研究记录").on_click(None)
+        revoked_confirm = page.dialog.actions[1]
+        await page.on_close(None)
+        await revoked_confirm.on_click(None)
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH") is not None
+
+    asyncio.run(check())

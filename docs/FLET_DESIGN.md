@@ -360,6 +360,12 @@ SQLite保存相对路径和完整文件SHA-256（仅用于误改检查），不�
 
 “同业发现”的前三进出只比较两次兼容peer扫描；watch更新没有新名次，个人页显示最近peer名次及其旧日期。暂停只影响默认呈现，恢复保留备注；掉出前三、前50或以后退市都不能删除个人记录。未知/不再上市的当前状态显示待核查，不拿缺行情解释为经营恶化。
 
+#### 显式删除与失败任务清理（S1试用补差）
+
+所有者可在详情二次确认删除个人研究记录：移除该watch_items行及本页草稿，不级联删除screen_runs、共享快照、外部笔记或备份，不改历史排名。暂停/掉出范围仍不自动删除；再次加入ack为空。删除短事务核对revision与updated_at，Web保存/已阅也携带读取时的updated_at，防止删除后重新加入导致revision重置而接受旧页写入；无修改的幂等重试仍保留。取消不改变数据库或草稿。
+
+仅failed/interrupted且无结果的任务可显式清理：以现有phase='dismissed'标记，从任务列表与同业最新尝试查询排除；保留request_id、别名、意图及记录，旧请求仍命中原任务而不重新排队。queued/running/succeeded拒绝清理；不删除快照、锁文件或worker发布文件，不新增表/迁移。按钮提交与异步返回复查身份、连接及页面代际；失效回调不得删除或重显私人视图。
+
 ### 4.5 SQLite 运行方式
 
 独立本地磁盘；短连接，不跨线程共享。显式事务统一采用 `sqlite3.connect(..., isolation_level=None)`，由BEGIN/COMMIT/ROLLBACK控制；不要把Python隐式事务与显式BEGIN混用。每个连接设置foreign_keys=ON、synchronous=FULL、busy_timeout=5000；WAL仅在初始化时设置并核验。超时显示稍后重试，不删除锁文件或无限等待。[S1][S2]
