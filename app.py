@@ -811,6 +811,13 @@ def build_app():
             submit_button = ft.Button("查找同业", disabled=anchor not in codes)
 
             async def on_submit(e):
+                if (
+                    submit_button.disabled
+                    or gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
                 submit_button.disabled = True
                 page.update()
                 pending = page_state.get("pending_peer_request")
@@ -829,10 +836,18 @@ def build_app():
                     )
                     if page_state.get("pending_peer_request") is pending:
                         page_state["pending_peer_request"] = None
-                    if gen == page_state["generation"] and actor.is_valid:
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
                         await navigate(f"/jobs/{job['job_id']}")
                 except (ServiceError, WorkspaceError, AuthError) as exc:
-                    if gen == page_state["generation"] and actor.is_valid:
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
                         update_feedback.value = str(exc)
                         submit_button.disabled = False
                         page.update()
@@ -1253,7 +1268,7 @@ def build_app():
                 page_state.setdefault("discover_boards", {}).pop(route, None)
                 await navigate(route)
 
-            async def retry(e):
+            async def return_to_discover(e):
                 if (
                     gen != page_state["generation"]
                     or not actor.is_valid
@@ -1268,6 +1283,97 @@ def build_app():
                 page_state["pending_peer_request"] = None
                 await go_discover(e)
 
+            async def retry(e):
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
+                if job["kind"] == "watch":
+                    await return_to_discover(e)
+                    return
+                busy = False
+                dialog_open = True
+
+                async def cancel(e):
+                    nonlocal dialog_open
+                    if not busy and gen == page_state["generation"] and page_state["connected"]:
+                        dialog_open = False
+                        page.pop_dialog()
+
+                async def confirm(e):
+                    nonlocal busy, dialog_open
+                    if (
+                        not dialog_open
+                        or busy
+                        or gen != page_state["generation"]
+                        or not actor.is_valid
+                        or not page_state["connected"]
+                    ):
+                        return
+                    busy = True
+                    confirm_button.disabled = True
+                    page.update()
+                    pending = page_state.get("pending_peer_request")
+                    if not pending or pending["anchor"] != job["anchor"]:
+                        pending = {"anchor": job["anchor"], "request_id": uuid.uuid4().hex}
+                        page_state["pending_peer_request"] = pending
+                    try:
+                        submitted = await asyncio.to_thread(
+                            request_peer_update,
+                            actor,
+                            job["anchor"],
+                            pending["request_id"],
+                            STATE_DIR,
+                            APP_MODE,
+                            TRACKER_ROOT,
+                        )
+                        if page_state.get("pending_peer_request") is pending:
+                            page_state["pending_peer_request"] = None
+                        if (
+                            gen == page_state["generation"]
+                            and actor.is_valid
+                            and page_state["connected"]
+                        ):
+                            dialog_open = False
+                            page.pop_dialog()
+                            await navigate(f"/jobs/{submitted['job_id']}")
+                    except (ServiceError, WorkspaceError, AuthError) as exc:
+                        if (
+                            gen == page_state["generation"]
+                            and actor.is_valid
+                            and page_state["connected"]
+                        ):
+                            feedback.value = (
+                                f"提交未确认：{exc}。可重试确认，同一请求不会重复执行。"
+                            )
+                            busy = False
+                            confirm_button.disabled = False
+                            page.update()
+
+                feedback = ft.Text("", color=ft.Colors.RED_700)
+                confirm_button = ft.TextButton("确认重新扫描", on_click=confirm)
+                page.show_dialog(
+                    ft.AlertDialog(
+                        modal=True,
+                        title=ft.Text("确认重新扫描"),
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    f"参照公司：{job['anchor']}。确认后提交更新任务，由独立worker重新获取资料；范围与目标日按提交时确定。"
+                                ),
+                                ft.Text(
+                                    "相同范围的在途任务会合并；重新获取不保证数据日或数值变化，原任务和已阅基准保留。"
+                                ),
+                                feedback,
+                            ],
+                            tight=True,
+                        ),
+                        actions=[ft.TextButton("取消", on_click=cancel), confirm_button],
+                    )
+                )
+
             remove_button = removal_button(
                 "清理失败任务",
                 "仅从列表移除此失败或中断任务，保留请求编号以防旧请求重新执行；不删除历史快照，也不会重试更新。",
@@ -1280,7 +1386,7 @@ def build_app():
                 "查看关注最新资料" if is_watch else "查看本次结果/诊断", on_click=open_result
             )
             retry_button = ft.Button(
-                "回首页重新确认更新" if is_watch else "重新扫描（先确认参照）", on_click=retry
+                "回首页重新确认更新" if is_watch else "重新扫描", on_click=retry
             )
 
             def show_status(current: dict[str, Any]):
@@ -1343,10 +1449,12 @@ def build_app():
                     ft.Text(
                         "查看关注最新资料可能包含后续更新，不代表此任务的历史快照。再次更新须回首页确认，按届时未暂停清单和已证明日期冻结新范围；原任务不变。"
                         if is_watch
-                        else "重新扫描须再次点击查找同业，按届时清单与已证明日历确定范围和目标日；不会更改原任务。",
+                        else "重新扫描将在确认后提交更新任务；重新获取成功不代表数据日或数值必然变化。查看本次结果仅阅读历史资料。",
                         size=12,
                     ),
-                    ft.Button("返回我的关注" if is_watch else "返回同业发现", on_click=retry),
+                    ft.Button(
+                        "返回我的关注" if is_watch else "返回同业发现", on_click=return_to_discover
+                    ),
                 ]
             )
 
@@ -1533,21 +1641,34 @@ def build_app():
             comparison_pending = not comparison["can_ack"]
             comparison_summary = ft.Text(comparison["summary"], weight=ft.FontWeight.BOLD)
 
-            def comparison_value(value):
+            def comparison_value(value, label, current):
                 if value is None or value == "":
-                    return "未提供/不适用"
+                    if (
+                        current
+                        and ctx.get("displayed_kind") == "watch"
+                        and label
+                        in (
+                            "行业",
+                            "参照公司",
+                        )
+                    ):
+                        return "固定关注更新不设此项"
+                    return "当前资料未记录" if current else "已阅基准未记录"
                 if isinstance(value, (tuple, list)):
                     return "、".join(str(v) for v in value) or "无"
                 return str(value)
 
             comparison_rows: list[ft.Control] = []
+            full_comparison: list[ft.Control] = []
             for item in comparison["items"]:
                 is_changed = bool(item["changed"] and ctx.get("ack_run_id"))
-                line = (
-                    f"{'【变化】' if is_changed else ''}"
-                    f"{item['label']}：{comparison_value(item['before'])} → "
-                    f"{comparison_value(item['after'])}"
+                after = comparison_value(item["after"], item["label"], True)
+                values = (
+                    f"{comparison_value(item['before'], item['label'], False)} → {after}"
+                    if ctx.get("ack_run_id")
+                    else after
                 )
+                line = f"{'【变化】' if is_changed else ''}{item['label']}：{values}"
                 if is_changed:
                     comparison_rows.append(
                         ft.Container(
@@ -1560,7 +1681,25 @@ def build_app():
                         )
                     )
                 else:
-                    comparison_rows.append(ft.Text(line, size=13, color=ft.Colors.GREY_800))
+                    full_comparison.append(ft.Text(line, size=13, color=ft.Colors.GREY_800))
+
+            comparison_key = (page_state["route"], "full_comparison")
+            comparison_body = ft.Column(
+                [
+                    ft.Text(
+                        "未记录表示快照中没有该字段，不能据此判断接口是否提供；核心资料获取失败会在页面顶部单独警示。",
+                        size=12,
+                    ),
+                    *full_comparison,
+                ],
+                visible=page_state["expanded_sections"].get(comparison_key, False),
+            )
+
+            async def toggle_comparison(e):
+                if gen == page_state["generation"] and actor.is_valid and page_state["connected"]:
+                    comparison_body.visible = not comparison_body.visible
+                    page_state["expanded_sections"][comparison_key] = comparison_body.visible
+                    page.update()
 
             async def on_ack(e):
                 if gen != page_state["generation"] or not page_state["connected"]:
@@ -1630,10 +1769,17 @@ def build_app():
             annual_roes = usable.get("annual_roes") or []
             roe_rows = [
                 ft.Text(
-                    f"{r.get('year')}年: ROE {r.get('roe')}% (公告日: {r.get('ann_date')})", size=13
+                    f"{r.get('year')}年: ROE {r.get('roe')}% (公告日: {r.get('ann_date') or '资料未记录'})",
+                    size=13,
                 )
                 for r in annual_roes
-            ]
+            ] or [ft.Text("年度ROE暂无可用资料，不能判断趋势。", color=ft.Colors.RED_900)]
+            financial_status = {
+                "ok": "财务资料可用",
+                "failed": "财务获取失败",
+                "missing": "财务资料缺失",
+                "conflict": "财务资料存在冲突",
+            }.get(str(usable.get("financial_status")), "暂无可用财务核查记录")
 
             delete_btn = removal_button(
                 "删除个人研究记录",
@@ -1845,11 +1991,14 @@ def build_app():
                                         else []
                                     ),
                                     ft.Text(
-                                        f"PB: {usable.get('pb', '无')} (估值日: {ctx.get('usable_valuation_date', '无')})",
+                                        f"PB: {usable.get('pb') if usable.get('pb') is not None else '暂无可用数据'} (估值日: {ctx.get('usable_valuation_date') or '暂无可用日期'})",
                                         size=14,
                                     ),
                                     ft.Text(
-                                        f"ROE三年均值: {usable.get('roe_mean', '无')}%", size=14
+                                        f"ROE三年均值: {usable['roe_mean']}%"
+                                        if usable.get("roe_mean") is not None
+                                        else "ROE三年均值：暂无可用数据",
+                                        size=14,
                                     ),
                                     *roe_rows,
                                     ft.Text(
@@ -1883,12 +2032,18 @@ def build_app():
                                     follow_btn,
                                     follow_feedback,
                                     ft.Text(
-                                        "上次已阅 → 当前资料", size=15, weight=ft.FontWeight.BOLD
+                                        "上次已阅 → 当前资料"
+                                        if ctx.get("ack_run_id")
+                                        else "当前资料（首次待阅，无已阅基准）",
+                                        size=15,
+                                        weight=ft.FontWeight.BOLD,
                                     ),
                                     comparison_summary,
                                     *comparison_rows,
+                                    ft.Button("来源与完整对照", on_click=toggle_comparison),
+                                    comparison_body,
                                     ft.Text(
-                                        f"核查状态: {usable.get('financial_status', '无')} ({usable.get('financial_checked_at', '')})",
+                                        f"核查状态：{financial_status}；核查时间：{usable.get('financial_checked_at') or '资料未记录'}",
                                         size=12,
                                         color=ft.Colors.GREY_700,
                                     ),
@@ -1918,7 +2073,7 @@ def build_app():
                     ft.Row(
                         controls=[
                             ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回", on_click=go_home),
-                            ft.Text("系统设置", size=18, weight=ft.FontWeight.BOLD),
+                            ft.Text("账户与运行信息", size=18, weight=ft.FontWeight.BOLD),
                         ]
                     ),
                     ft.Text(f"当前模式: {APP_MODE}", size=14),
@@ -1997,7 +2152,9 @@ def build_app():
                         padding=ft.Padding.symmetric(horizontal=6, vertical=2),
                         border_radius=4,
                     ),
-                    ft.IconButton(ft.Icons.SETTINGS, tooltip="设置", on_click=go_settings),
+                    ft.IconButton(
+                        ft.Icons.SETTINGS, tooltip="账户与运行信息", on_click=go_settings
+                    ),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),

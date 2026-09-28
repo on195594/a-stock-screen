@@ -784,7 +784,7 @@ def test_real_logout_cleanup_and_actor_revocation(tmp_path, monkeypatch):
 
         content_container = col.content.controls[1]
         settings_view = content_container.content
-        assert settings_view.controls[0].controls[1].value == "系统设置"
+        assert settings_view.controls[0].controls[1].value == "账户与运行信息"
         settings_back = settings_view.controls[0].controls[0]
         assert inspect.iscoroutinefunction(settings_back.on_click)
         await settings_back.on_click(None)
@@ -1435,6 +1435,109 @@ def test_removal_dialog_cancel_conflict_navigation_and_readd(tmp_path, monkeypat
         await revoked_confirm.on_click(None)
         with connect_workspace(tmp_path, "demo") as conn:
             assert get_watch_item(conn, "600001.SH") is not None
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    "outcome", ["success", "cancel", "navigation", "disconnect", "revocation", "uncertain"]
+)
+def test_peer_rescan_confirmation_submits_task(tmp_path, monkeypatch, outcome):
+    from services import request_peer_update
+    from worker import run_worker
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    actor = app.create_demo_actor()
+    monkeypatch.setattr(app, "create_demo_actor", lambda: actor)
+    original = request_peer_update(actor, "600001.SH", "original", tmp_path, "demo")
+    run_worker(tmp_path, "demo", None, once=True)
+    requests = []
+
+    def submit(*args):
+        requests.append(args[2])
+        result = request_peer_update(*args)
+        if outcome == "uncertain" and len(requests) == 1:
+            raise app.ServiceError("synthetic lost receipt")
+        return result
+
+    monkeypatch.setattr(app, "request_peer_update", submit)
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        await page.on_route_change(SimpleNamespace(route=f"/jobs/{original['job_id']}"))
+        button = next(
+            c
+            for c in app_controls(page.controls[0])
+            if isinstance(c, ft.Button) and c.content == "重新扫描"
+        )
+        await button.on_click(None)
+        assert requests == []
+        confirm = page.dialog.actions[1]
+        if outcome == "cancel":
+            await page.dialog.actions[0].on_click(None)
+        elif outcome == "navigation":
+            await page.on_route_change(SimpleNamespace(route="/settings"))
+        elif outcome == "disconnect":
+            await page.on_disconnect(None)
+        elif outcome == "revocation":
+            actor.revoke()
+        await confirm.on_click(None)
+        if outcome == "uncertain":
+            await confirm.on_click(None)
+            assert len(requests) == 2 and requests[0] == requests[1]
+        with connect_workspace(tmp_path, "demo") as conn:
+            jobs = conn.execute(
+                "SELECT job_id,status FROM update_jobs ORDER BY requested_at"
+            ).fetchall()
+        if outcome in ("success", "uncertain"):
+            assert len(jobs) == 2
+            assert jobs[1][1] == "queued"
+            assert page.route == f"/jobs/{jobs[1][0]}"
+            await confirm.on_click(None)
+            assert len(requests) == (2 if outcome == "uncertain" else 1)
+        else:
+            assert len(jobs) == 1 and not requests
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
+def test_first_review_shows_current_facts_and_folds_missing_metadata(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    import_snapshot(
+        tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
+    )
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        controls = list(app_controls(page.controls[0]))
+        toggle = next(
+            c for c in controls if isinstance(c, ft.Button) and c.content == "来源与完整对照"
+        )
+        body = next(
+            c
+            for c in controls
+            if isinstance(c, ft.Column)
+            and c.controls
+            and isinstance(c.controls[0], ft.Text)
+            and str(c.controls[0].value).startswith("未记录表示")
+        )
+        assert body.visible is False
+        texts = [str(c.value) for c in controls if isinstance(c, ft.Text)]
+        assert "当前资料（首次待阅，无已阅基准）" in texts
+        assert "PB（倍）：1.85" in texts
+        assert not any("未提供/不适用" in t or " → " in t for t in texts)
+        await toggle.on_click(None)
+        assert body.visible is True
+        assert "2025年报告类型：当前资料未记录" in texts
+        await page.on_close(None)
 
     asyncio.run(check())
 

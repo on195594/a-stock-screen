@@ -180,7 +180,7 @@ def main() -> int:
 
                 # Click the top-right Settings icon, then its back arrow (real browser events).
                 page.locator("flt-semantics[role='button']").first.click()
-                page.wait_for_selector("text=系统设置", timeout=10000)
+                page.wait_for_selector("text=账户与运行信息", timeout=10000)
                 page.locator("flt-semantics[role='button']").nth(1).click()
                 page.wait_for_selector("text=估值基准日", timeout=10000)
 
@@ -265,6 +265,16 @@ def main() -> int:
                     reason.scroll_into_view_if_needed()
                     reason.wait_for(state="visible", timeout=10000)
 
+                # First review has current facts, not empty old-value arrows or expanded metadata.
+                expect(
+                    page.get_by_text("当前资料（首次待阅，无已阅基准）", exact=True)
+                ).to_be_visible()
+                metadata = page.get_by_text("2025年报告类型：当前资料未记录", exact=True)
+                expect(metadata).not_to_be_visible()
+                page.get_by_role("button", name="来源与完整对照", exact=True).click()
+                expect(metadata).to_be_visible()
+                page.get_by_role("button", name="来源与完整对照", exact=True).click()
+                expect(metadata).not_to_be_visible()
                 # Following is complete without a form; old notes are optional and preserved.
                 expect(page.locator("textarea[aria-label*='理由']").first).not_to_be_visible()
                 open_notes()
@@ -582,10 +592,37 @@ def main() -> int:
                         ).fetchone()[0]
                         == "dismissed"
                     )
+                # Re-scan is a confirmed submission, not another link to historical results.
+                with sqlite3.connect(db_path) as conn:
+                    peer_job = conn.execute(
+                        "SELECT job_id FROM update_jobs WHERE kind='peer' AND status='succeeded' LIMIT 1"
+                    ).fetchone()[0]
+                    count_before = conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0]
+                page.goto(f"{base_url}/jobs/{peer_job}")
+                page.wait_for_load_state("domcontentloaded")
+                enable_accessibility()
+                page.get_by_role("button", name="重新扫描", exact=True).click()
+                page.get_by_role("button", name="取消", exact=True).click()
+                with sqlite3.connect(db_path) as conn:
+                    assert (
+                        conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0]
+                        == count_before
+                    )
+                page.get_by_role("button", name="重新扫描", exact=True).click()
+                page.get_by_role("button", name="确认重新扫描", exact=True).click()
+                expect(page).not_to_have_url(f"{base_url}/jobs/{peer_job}")
+                page.get_by_text("状态：完成", exact=False).wait_for(state="visible", timeout=30000)
+                with sqlite3.connect(db_path) as conn:
+                    assert (
+                        conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0]
+                        == count_before + 1
+                    )
+                page.get_by_role("button", name="查看本次结果/诊断", exact=True).click()
+                page.get_by_text("PB 1.85 倍", exact=False).first.wait_for(state="visible")
                 # Flet may attempt optional CDN resources; every external request was aborted.
                 print(f"External requests blocked (none allowed): {sorted(set(blocked_requests))}")
                 print(
-                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> pause/reload/resume -> fixed watch submit/worker/reload -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload."
+                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> pause/reload/resume -> fixed watch submit/worker/reload -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload -> rescan cancel/confirm/worker/result."
                 )
                 return 0
             except Exception as exc:
