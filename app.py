@@ -368,8 +368,12 @@ def build_app():
 
             for it in data["watch_items"]:
                 code = it["code"]
-                badge_color = (
-                    ft.Colors.BLUE_700 if it["status"] == "research" else ft.Colors.GREY_700
+                status_color = (
+                    ft.Colors.BLUE_700
+                    if it["status"] == "research"
+                    else (
+                        ft.Colors.BLUE_GREY_700 if it["status"] == "observe" else ft.Colors.GREY_700
+                    )
                 )
                 status_chip = ft.Container(
                     content=ft.Text(
@@ -379,7 +383,7 @@ def build_app():
                         size=12,
                         color=ft.Colors.WHITE,
                     ),
-                    bgcolor=badge_color,
+                    bgcolor=status_color,
                     padding=ft.Padding.symmetric(horizontal=8, vertical=2),
                     border_radius=4,
                 )
@@ -435,9 +439,39 @@ def build_app():
                 )
 
             if not items_controls:
+
+                async def go_to_discover(e):
+                    if (
+                        gen != page_state["generation"]
+                        or not actor.is_valid
+                        or not page_state["connected"]
+                    ):
+                        return
+                    await go_discover(e)
+
                 items_controls.append(
-                    ft.Text(
-                        "暂无关注标的，去同业发现一键关注，无需填写笔记", color=ft.Colors.GREY_700
+                    ft.Card(
+                        semantic_container=False,
+                        content=ft.Container(
+                            padding=20,
+                            content=ft.Column(
+                                controls=[
+                                    ft.Text(
+                                        "暂无关注的公司",
+                                        size=16,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    ft.Text(
+                                        "在『同业发现』查找行业参照公司并点击关注，关注无须填写理由或笔记。",
+                                        size=13,
+                                        color=ft.Colors.GREY_700,
+                                    ),
+                                    ft.Button("前往同业发现", on_click=go_to_discover),
+                                ],
+                                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                spacing=8,
+                            ),
+                        ),
                     )
                 )
 
@@ -482,9 +516,10 @@ def build_app():
                     ),
                     ft.Text(page_state.pop("notice", ""), color=ft.Colors.GREEN_700),
                     ft.Text("固定关注更新尚未接入；同业扫描不会替代关注清单更新。", size=13),
-                    ft.Button(
-                        "开始同业研究" if not data["total_watch_count"] else "前往同业扫描",
-                        on_click=go_discover,
+                    *(
+                        [ft.Button("前往同业扫描", on_click=go_discover)]
+                        if data["total_watch_count"]
+                        else []
                     ),
                     ft.Divider(height=16),
                     ft.Text(
@@ -1265,15 +1300,27 @@ def build_app():
                     return "、".join(str(v) for v in value) or "无"
                 return str(value)
 
-            comparison_rows = [
-                ft.Text(
-                    f"{'【变化】' if item['changed'] and ctx.get('ack_run_id') else ''}"
+            comparison_rows: list[ft.Control] = []
+            for item in comparison["items"]:
+                is_changed = bool(item["changed"] and ctx.get("ack_run_id"))
+                line = (
+                    f"{'【变化】' if is_changed else ''}"
                     f"{item['label']}：{comparison_value(item['before'])} → "
-                    f"{comparison_value(item['after'])}",
-                    size=13,
+                    f"{comparison_value(item['after'])}"
                 )
-                for item in comparison["items"]
-            ]
+                if is_changed:
+                    comparison_rows.append(
+                        ft.Container(
+                            content=ft.Text(
+                                line, size=13, weight=ft.FontWeight.W_600, color=ft.Colors.AMBER_900
+                            ),
+                            bgcolor=ft.Colors.AMBER_50,
+                            padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                            border_radius=4,
+                        )
+                    )
+                else:
+                    comparison_rows.append(ft.Text(line, size=13, color=ft.Colors.GREY_800))
 
             async def on_ack(e):
                 if gen != page_state["generation"] or not page_state["connected"]:
@@ -1558,7 +1605,14 @@ def build_app():
                                         "统计范围：本次沪深主板非金融、TuShare同行业合格样本，最多50家，偏向大市值；行业标签不证明业务可比。",
                                         size=12,
                                     ),
-                                    ft.Text(FACT_LIMITS, size=13),
+                                    ft.Container(
+                                        content=ft.Text(
+                                            FACT_LIMITS, size=13, color=ft.Colors.GREY_800
+                                        ),
+                                        bgcolor=ft.Colors.GREY_100,
+                                        padding=8,
+                                        border_radius=6,
+                                    ),
                                     follow_btn,
                                     follow_feedback,
                                     ft.Text(

@@ -320,6 +320,35 @@ class AppMockPage:
         self.logged_out = True
 
 
+@pytest.mark.parametrize("invalidate", ["navigation", "disconnect", "revocation"])
+def test_empty_home_entry_expires_with_page(tmp_path, monkeypatch, invalidate):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    actor = app.create_demo_actor()
+    monkeypatch.setattr(app, "create_demo_actor", lambda: actor)
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        controls = list(app_controls(page.controls[0]))
+        entry = next(
+            c for c in controls if isinstance(c, ft.Button) and c.content == "前往同业发现"
+        )
+        if invalidate == "navigation":
+            await page.on_route_change(SimpleNamespace(route="/settings"))
+        elif invalidate == "disconnect":
+            await page.on_disconnect(None)
+        else:
+            actor.revoke()
+        route, updates = page.route, page.updated_count
+        await entry.on_click(None)
+        assert page.route == route and page.updated_count == updates
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
 def test_home_cards_show_each_company_date(tmp_path, monkeypatch):
     initialize(tmp_path, "demo", journal_mode="DELETE")
     monkeypatch.setattr(app, "APP_MODE", "demo")
@@ -1064,7 +1093,12 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
         def button(label):
             return next(c for c in controls() if isinstance(c, ft.Button) and c.content == label)
 
-        await button("开始同业研究").on_click(None)
+        entry = button("前往同业发现")
+        assert (
+            sum(isinstance(c, ft.Button) and c.content == "前往同业发现" for c in controls()) == 1
+        )
+        assert not any(isinstance(c, ft.Button) and c.content == "开始同业研究" for c in controls())
+        await entry.on_click(None)
         discover_route = page.route
         assert page.navigation_bar.selected_index == 1
         texts = [str(c.value) for c in controls() if isinstance(c, ft.Text)]
@@ -1193,6 +1227,15 @@ def test_company_changed_ack_requires_displayed_comparison(tmp_path, monkeypatch
         texts = [str(c.value) for c in controls if isinstance(c, ft.Text)]
         assert "上次已阅 → 当前资料" in texts
         assert "【变化】PB（倍）：1.85 → 1.8" in texts
+        highlight = next(
+            c
+            for c in controls
+            if isinstance(c, ft.Container)
+            and isinstance(c.content, ft.Text)
+            and c.content.value == "【变化】PB（倍）：1.85 → 1.8"
+        )
+        assert highlight.bgcolor == ft.Colors.AMBER_50
+        assert highlight.content.weight == ft.FontWeight.W_600
         assert "【变化】2025年ROE（%）：15.8 → 16.5" in texts
         with connect_workspace(tmp_path, "demo") as conn:
             assert get_watch_item(conn, "600001.SH")["ack_run_id"] == first

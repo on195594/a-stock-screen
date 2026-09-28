@@ -185,7 +185,22 @@ def main() -> int:
                 page.wait_for_selector("text=估值基准日", timeout=10000)
 
                 # U01: no snapshots or notes; no README/CLI import needed.
-                assert click_semantics_button("开始同业研究")
+                entry = page.get_by_role("button", name="前往同业发现", exact=True)
+                expect(entry).to_have_count(1)
+                expect(page.get_by_role("button", name="开始同业研究", exact=True)).to_have_count(0)
+                for width in (360, 390, 430):
+                    page.set_viewport_size({"width": width, "height": 844})
+                    title = page.get_by_text("暂无关注的公司", exact=True)
+                    title.scroll_into_view_if_needed()
+                    expect(title).to_be_visible()
+                    entry.scroll_into_view_if_needed()
+                    expect(entry).to_be_visible()
+                    bounds = entry.bounding_box()
+                    assert (
+                        bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
+                    )
+                page.set_viewport_size({"width": 390, "height": 844})
+                entry.click()
                 page.wait_for_selector("text=暂无参照公司", timeout=10000)
                 assert click_semantics_button("查找同业"), "Could not submit peer update"
                 page.wait_for_selector("text=更新任务", timeout=10000)
