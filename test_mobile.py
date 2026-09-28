@@ -389,13 +389,57 @@ def main() -> int:
                     ).fetchone() == ("observe",)
                     assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
 
-                # 9. Re-enter detail page to verify persisted reason in the detail view
-                detail_btn = page.locator("flt-semantics[role='button']:has-text('查看详情')").first
-                if detail_btn.is_visible():
-                    detail_btn.click()
-                else:
-                    assert click_semantics_button("查看详情"), "Could not click 查看详情 button"
-                page.wait_for_selector("text=公司筛选事实", timeout=10000)
+                # A real UI submission reaches the independent fixed-watch worker.
+                update = page.get_by_role("button", name="更新资料", exact=True)
+                for width in (360, 390, 430):
+                    page.set_viewport_size({"width": width, "height": 844})
+                    update.scroll_into_view_if_needed()
+                    bounds = update.bounding_box()
+                    assert (
+                        bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
+                    )
+                page.set_viewport_size({"width": 390, "height": 844})
+                update.click()
+                page.get_by_text("固定关注范围（1家）：600001.SH", exact=True).wait_for(
+                    state="visible"
+                )
+                page.get_by_role("button", name="查看关注最新资料", exact=True).wait_for(
+                    state="visible", timeout=15000
+                )
+                with sqlite3.connect(db_path) as conn:
+                    status, phase, result_run = conn.execute(
+                        "SELECT status,phase,result_run_id FROM update_jobs WHERE kind='watch'"
+                    ).fetchone()
+                    assert (status, phase) == ("succeeded", "complete") and result_run
+                    assert (
+                        conn.execute(
+                            "SELECT reason,next_check,note_url,added_run_id,ack_run_id,ack_at FROM watch_items WHERE code='600001.SH'"
+                        ).fetchone()
+                        == preserved
+                    )
+                    assert (
+                        conn.execute(
+                            "SELECT count(*) FROM screen_runs WHERE kind='peer'"
+                        ).fetchone()[0]
+                        == 1
+                    )  # Only the explicit peer scan; watch must not create another board.
+                page.reload()
+                page.wait_for_load_state("domcontentloaded")
+                enable_accessibility()
+                page.get_by_role("button", name="查看关注最新资料", exact=True).click()
+
+                # 9. Wait for the asynchronous home render, then inspect persisted notes.
+                detail_btn = page.get_by_role("button", name="查看详情", exact=True).first
+                detail_btn.wait_for(state="visible", timeout=10000)
+                detail_btn.click()
+                page.wait_for_selector("text=公司资料事实", timeout=10000)
+                expect(
+                    page.get_by_text(
+                        "本次为固定关注事实更新，不重新选择同业、不生成新名次；PB中位数不适用。",
+                        exact=True,
+                    )
+                ).to_be_visible()
+                expect(page.get_by_text("最近同业名次：", exact=False)).to_be_visible()
                 time.sleep(1)
                 open_notes()
                 detail_reason = page.locator("textarea[aria-label*='理由']").first
@@ -427,7 +471,7 @@ def main() -> int:
                 page.wait_for_selector("text=本次尝试：部分完成", timeout=10000)
                 page.wait_for_selector("text=当前展示上次完整榜", timeout=10000)
                 with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
-                    assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
+                    assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 2
                 # Real confirmation/cancellation and visible deletion feedback, not DB fallbacks.
                 page.locator("[aria-label='我的关注']").first.click()
                 page.get_by_role("button", name="查看详情", exact=True).first.click()
@@ -482,7 +526,7 @@ def main() -> int:
                 page.get_by_text("关注清单 (0)", exact=True).wait_for(state="visible")
                 with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
                     assert conn.execute("SELECT count(*) FROM watch_items").fetchone()[0] == 0
-                    assert conn.execute("SELECT count(*) FROM screen_runs").fetchone()[0] == 2
+                    assert conn.execute("SELECT count(*) FROM screen_runs").fetchone()[0] == 3
                 # Immutable results remain available, and re-adding does not restore old notes/ack.
                 page.goto(company_url)
                 page.wait_for_load_state("domcontentloaded")
@@ -537,7 +581,7 @@ def main() -> int:
                 # Flet may attempt optional CDN resources; every external request was aborted.
                 print(f"External requests blocked (none allowed): {sorted(set(blocked_requests))}")
                 print(
-                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> pause/reload/resume -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload."
+                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> pause/reload/resume -> fixed watch submit/worker/reload -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload."
                 )
                 return 0
             except Exception as exc:

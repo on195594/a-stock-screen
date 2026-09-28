@@ -1159,6 +1159,23 @@ def watch_run_targets(conn: sqlite3.Connection, run_id: str) -> set[str] | None:
         return None
 
 
+def latest_watch_failure(
+    conn: sqlite3.Connection,
+    code: str,
+    after: str | None,
+) -> dict[str, Any] | None:
+    """A failed fixed-code attempt is a gap even without a published snapshot."""
+    row = conn.execute(
+        """SELECT * FROM update_jobs WHERE kind='watch'
+        AND status IN ('failed','interrupted')
+        AND COALESCE(finished_at, updated_at, requested_at) > ?
+        AND EXISTS (SELECT 1 FROM json_each(update_jobs.payload_json, '$.codes') WHERE value=?)
+        ORDER BY COALESCE(finished_at, updated_at, requested_at) DESC, job_id DESC LIMIT 1""",
+        (after or "", code),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def mark_watch_ack(
     conn: sqlite3.Connection,
     *,
@@ -1180,6 +1197,8 @@ def mark_watch_ack(
         raise WorkspaceError("displayed run not found")
     if run["health"] == "unverified":
         raise WorkspaceError("cannot acknowledge unverified run")
+    if latest_watch_failure(conn, code, run["captured_at"]):
+        raise WorkspaceError("cannot acknowledge old facts after a failed watch update")
 
     # Monotonic check: displayed run cannot be older than current ack run
     if item["ack_run_id"]:

@@ -349,6 +349,66 @@ def test_empty_home_entry_expires_with_page(tmp_path, monkeypatch, invalidate):
     asyncio.run(check())
 
 
+@pytest.mark.parametrize("invalidate", ["navigation", "disconnect", "revocation", "uncertain"])
+def test_watch_submit_lifecycle_and_uncertain_receipt(tmp_path, monkeypatch, invalidate):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    actor = app.create_demo_actor()
+    monkeypatch.setattr(app, "create_demo_actor", lambda: actor)
+    run = import_snapshot(
+        tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
+    )
+    app.save_watch(actor, "600001.SH", run, {}, 0, tmp_path, "demo")
+    real_submit = app.request_watch_update
+    calls = []
+
+    def uncertain(*args):
+        calls.append(args[1])
+        result = real_submit(*args)
+        if len(calls) == 1:
+            raise TimeoutError("synthetic receipt lost")
+        return result
+
+    monkeypatch.setattr(app, "request_watch_update", uncertain)
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        button = next(
+            c
+            for c in app_controls(page.controls[0])
+            if isinstance(c, ft.Button) and c.content == "更新资料"
+        )
+        if invalidate == "navigation":
+            await page.on_route_change(SimpleNamespace(route="/settings"))
+        elif invalidate == "disconnect":
+            await page.on_disconnect(None)
+        elif invalidate == "revocation":
+            actor.revoke()
+        await button.on_click(None)
+        if invalidate == "uncertain":
+            assert not button.disabled and len(calls) == 1
+            assert any(
+                "提交结果未确认" in str(c.value)
+                for c in app_controls(page.controls[0])
+                if isinstance(c, ft.Text)
+            )
+            await button.on_click(None)
+            assert calls[0] == calls[1] and page.route.startswith("/jobs/")
+            texts = [c.value for c in app_controls(page.controls[0]) if isinstance(c, ft.Text)]
+            assert any("固定关注范围（1家）：600001.SH" in t for t in texts)
+        else:
+            assert not calls
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == (
+                1 if invalidate == "uncertain" else 0
+            )
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
 def test_home_pause_fold_resume_and_stale_callback(tmp_path, monkeypatch):
     from services import save_watch
 

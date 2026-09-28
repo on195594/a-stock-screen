@@ -22,7 +22,7 @@ check:
 	@echo "==> Running ruff checks..."
 	@$(PYTHON) -m ruff check --cache-dir /tmp/.ruff_cache .
 	@echo "==> Running mypy checks..."
-	@$(PYTHON) -m mypy --cache-dir /tmp/.mypy_cache workspace.py auth.py screen.py services.py worker.py app.py
+	@$(PYTHON) -m mypy --cache-dir /tmp/.mypy_cache workspace.py auth.py screen.py services.py watch.py worker.py app.py
 
 test-mobile:
 	@echo "==> Running mobile end-to-end browser test..."

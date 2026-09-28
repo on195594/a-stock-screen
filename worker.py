@@ -1,4 +1,4 @@
-"""Single-process worker for user-submitted peer updates; no web session or OAuth secret."""
+"""Single-process worker for user-submitted peer/watch updates; no OAuth secret."""
 
 from __future__ import annotations
 
@@ -12,10 +12,20 @@ import signal
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from screen import RULE, ScreenError, build_live_snapshot
-from workspace import Mode, WorkspaceError, connect_workspace, get_run, import_snapshot, utc_now
+from watch import build_watch_snapshot, validate_watch_snapshot
+from workspace import (
+    Mode,
+    WorkspaceError,
+    connect_workspace,
+    get_run,
+    import_snapshot,
+    parse_iso_utc,
+    register_run,
+    utc_now,
+)
 
 STOP = False
 
@@ -27,6 +37,34 @@ def _stop(signum: int, frame: Any) -> None:
 
 def _payload(job: dict[str, Any]) -> dict[str, Any]:
     payload = json.loads(job["payload_json"])
+    if not isinstance(payload, dict):
+        raise WorkspaceError("invalid job payload")
+    if job["kind"] == "watch":
+        codes = payload.get("codes")
+        canonical = {key: value for key, value in payload.items() if key != "intent_hash"}
+        digest = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+        if (
+            set(payload) != {"codes", "intent", "intent_hash", "anchor", "target_date", "rule_id"}
+            or not isinstance(codes, list)
+            or not 0 < len(codes) <= 50
+            or not all(
+                isinstance(c, str) and re.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)", c) for c in codes
+            )
+            or codes != sorted(set(codes))
+            or payload.get("intent") != {"kind": "watch"}
+            or payload.get("anchor") is not None
+            or payload.get("rule_id") is not None
+            or payload.get("intent_hash") != digest
+            or job["dedupe_key"] != digest
+        ):
+            raise WorkspaceError("invalid frozen watch identity")
+        target = payload.get("target_date")
+        if (
+            not isinstance(target, str)
+            or datetime.strptime(target, "%Y-%m-%d").strftime("%Y-%m-%d") != target
+        ):
+            raise WorkspaceError("invalid frozen watch date")
+        return payload
     watchlist = payload.get("watchlist")
     if (
         not isinstance(watchlist, list)
@@ -56,8 +94,14 @@ def _payload(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _validate_snapshot(snap: dict[str, Any], job: dict[str, Any], mode: Mode) -> None:
+def _validate_snapshot(
+    snap: dict[str, Any], job: dict[str, Any], mode: Mode
+) -> Literal["complete", "partial"] | None:
     payload = _payload(job)
+    if not isinstance(snap, dict):
+        raise WorkspaceError("invalid snapshot root")
+    if job["kind"] == "watch":
+        return validate_watch_snapshot(snap, payload, job, mode)
     meta = snap.get("workspace_meta")
     source = "fixture" if mode == "demo" else "tracker"
     scope = snap.get("scope")
@@ -92,6 +136,7 @@ def _validate_snapshot(snap: dict[str, Any], job: dict[str, Any], mode: Mode) ->
         or {r.get("code") for r in rows} != set(scope.get("selected_codes") or [])
     ):
         raise WorkspaceError("job snapshot does not match frozen intent or scope")
+    return None
 
 
 def _finish(
@@ -111,10 +156,10 @@ def _finish(
             payload = _payload(job)
             if (
                 not run
-                or run["kind"] != "peer"
+                or run["kind"] != job["kind"]
                 or run["anchor_code"] != payload["anchor"]
                 or run["valuation_date"] != payload["target_date"]
-                or run["rule_id"] != RULE
+                or run["rule_id"] != payload["rule_id"]
                 or run["snapshot_sha256"] != snapshot_sha256
                 or run["health"] == "unverified"
             ):
@@ -177,8 +222,38 @@ def _publish(state_dir: Path, mode: Mode, job: dict[str, Any], snap: dict[str, A
 def _register(state_dir: Path, mode: Mode, job: dict[str, Any], final: Path) -> None:
     raw = final.read_bytes()
     snap = json.loads(raw)
-    _validate_snapshot(snap, job, mode)
-    run_id = import_snapshot(state_dir, final, mode)
+    health = _validate_snapshot(snap, job, mode)
+    if job["kind"] == "watch":
+        assert health is not None
+        run_id = job["job_id"]
+        conn = connect_workspace(state_dir, mode)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = get_run(conn, run_id)
+            if existing:
+                if existing["snapshot_sha256"] != hashlib.sha256(raw).hexdigest():
+                    raise WorkspaceError("watch recovery snapshot hash mismatch")
+            else:
+                register_run(
+                    conn,
+                    run_id=run_id,
+                    kind="watch",
+                    anchor_code=None,
+                    rule_id=None,
+                    captured_at=parse_iso_utc(snap["screened_at"]),
+                    valuation_date=snap["data_date"],
+                    health=health,
+                    snapshot_path=final.relative_to(state_dir).as_posix(),
+                    snapshot_bytes=raw,
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        run_id = import_snapshot(state_dir, final, mode)
     _finish(
         state_dir,
         mode,
@@ -236,7 +311,11 @@ def _claim(state_dir: Path, mode: Mode) -> dict[str, Any] | None:
 def _process(state_dir: Path, mode: Mode, tracker_root: Path | None, job: dict[str, Any]) -> None:
     try:
         payload = _payload(job)
-        if mode == "demo":
+        if job["kind"] == "watch":
+            snap = build_watch_snapshot(
+                payload["codes"], payload["target_date"], mode, lambda: STOP
+            )
+        elif mode == "demo":
             fixture = Path(__file__).parent / "tests" / "fixtures" / "peer_complete_v1.json"
             snap = json.loads(fixture.read_text(encoding="utf-8"))
             snap["screened_at"] = datetime.now(UTC).isoformat()
@@ -264,13 +343,18 @@ def _process(state_dir: Path, mode: Mode, tracker_root: Path | None, job: dict[s
             "anchor": payload["anchor"],
             "target_date": payload["target_date"],
         }
+        if job["kind"] == "watch":
+            snap["workspace_meta"]["expected_codes"] = payload["codes"]
         _publish(state_dir, mode, job, snap)
     except (WorkspaceError, ScreenError, OSError, ValueError, TypeError) as exc:
         # Provider exceptions may contain credentials; never log or persist their text.
-        print(f"Peer job {job['job_id']} failed ({type(exc).__name__})", flush=True)
+        print(f"Update job {job['job_id']} failed ({type(exc).__name__})", flush=True)
         if _final_path(state_dir, job["job_id"]).is_file():
             # Preserve running for recovery after a crash between file and DB publication.
             raise WorkspaceError("final snapshot needs recovery") from None
+        if STOP:
+            _finish(state_dir, mode, job, None, "interrupted", "更新中断，请手动重试")
+            return
         summary = "更新未完成，请核查数据来源并重试"
         if isinstance(exc, ScreenError):
             if str(exc).startswith("金融行业不适用 peer-screen-v1:"):
@@ -315,7 +399,7 @@ def run_worker(state_dir: Path, mode: Mode, tracker_root: Path | None, once: boo
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="User-initiated peer update worker")
+    parser = argparse.ArgumentParser(description="User-initiated peer/watch update worker")
     parser.add_argument("--state-dir", type=Path, default=Path(".local/demo"))
     parser.add_argument("--mode", choices=("demo", "production"), default="demo")
     parser.add_argument("--tracker-root", type=Path)

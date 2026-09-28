@@ -30,6 +30,7 @@ from services import (
     mark_seen,
     peer_anchors,
     request_peer_update,
+    request_watch_update,
     save_watch,
     set_watch_status,
 )
@@ -368,6 +369,52 @@ def build_app():
             items_controls: list[ft.Control] = []
             paused_controls: list[ft.Control] = []
             status_feedback = ft.Text("", color=ft.Colors.RED_700)
+            active_count = sum(item["status"] != "paused" for item in data["watch_items"])
+            update_button = ft.Button("更新资料", disabled=not 0 < active_count <= 50)
+
+            async def submit_watch(e):
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                    or update_button.disabled
+                ):
+                    return
+                update_button.disabled = True
+                page.update()
+                request_id = page_state.setdefault("pending_watch_request", uuid.uuid4().hex)
+                try:
+                    job = await asyncio.to_thread(
+                        request_watch_update, actor, request_id, STATE_DIR, APP_MODE, TRACKER_ROOT
+                    )
+                    if page_state.get("pending_watch_request") == request_id:
+                        page_state.pop("pending_watch_request", None)
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        await navigate(f"/jobs/{job['job_id']}")
+                except (ServiceError, WorkspaceError, AuthError) as exc:
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        status_feedback.value = str(exc)
+                        update_button.disabled = False
+                        page.update()
+                except Exception:
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        status_feedback.value = "提交结果未确认；返回首页查看最近更新。再次提交会先查询原请求，不会自动重放。"
+                        update_button.disabled = False
+                        page.update()
+
+            update_button.on_click = submit_watch
             last_group = None
 
             for it in sorted(
@@ -585,7 +632,7 @@ def build_app():
 
                 job_controls.append(
                     ft.Button(
-                        f"{job['anchor']} · {job['target_date']} · {job_status_label(job)}",
+                        f"{job['anchor'] if job['kind'] == 'peer' else '固定关注'} · {job['target_date']} · {job_status_label(job)}",
                         on_click=open_job,
                     )
                 )
@@ -607,17 +654,16 @@ def build_app():
                                         ),
                                     ]
                                 ),
-                                ft.Button(
-                                    "更新资料",
-                                    disabled=True,
-                                    tooltip="关注清单单独更新尚未实现；请到同业发现提交同业扫描",
-                                ),
+                                update_button,
                             ],
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         ),
                     ),
                     ft.Text(page_state.pop("notice", ""), color=ft.Colors.GREEN_700),
-                    ft.Text("固定关注更新尚未接入；同业扫描不会替代关注清单更新。", size=13),
+                    ft.Text(
+                        f"提交时冻结未暂停的关注公司（当前{active_count}家，最多50家）；只更新事实，不重新排名。空清单或超过50家时不可提交。",
+                        size=13,
+                    ),
                     *(
                         [ft.Button("前往同业扫描", on_click=go_discover)]
                         if data["total_watch_count"]
@@ -633,7 +679,7 @@ def build_app():
                     *items_controls,
                     *([paused_button, paused_body] if paused_controls else []),
                     *(
-                        [ft.Text("最近同业更新", weight=ft.FontWeight.BOLD)] + job_controls
+                        [ft.Text("最近更新", weight=ft.FontWeight.BOLD)] + job_controls
                         if job_controls
                         else []
                     ),
@@ -1134,11 +1180,30 @@ def build_app():
             status_text = ft.Text("")
 
             async def open_result(e):
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
+                if job["kind"] == "watch":
+                    await navigate("/")
+                    return
                 route = "/discover?" + urlencode({"anchor": job["anchor"], "job": job_id})
                 page_state.setdefault("discover_boards", {}).pop(route, None)
                 await navigate(route)
 
             async def retry(e):
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
+                if job["kind"] == "watch":
+                    page_state.pop("pending_watch_request", None)
+                    await navigate("/")
+                    return
                 page_state["selected_anchor"] = job["anchor"]
                 page_state["pending_peer_request"] = None
                 await go_discover(e)
@@ -1150,8 +1215,13 @@ def build_app():
                 gen,
                 actor,
             )
-            result_button = ft.Button("查看本次结果/诊断", on_click=open_result)
-            retry_button = ft.Button("重新扫描（先确认参照）", on_click=retry)
+            is_watch = job["kind"] == "watch"
+            result_button = ft.Button(
+                "查看关注最新资料" if is_watch else "查看本次结果/诊断", on_click=open_result
+            )
+            retry_button = ft.Button(
+                "回首页重新确认更新" if is_watch else "重新扫描（先确认参照）", on_click=retry
+            )
 
             def show_status(current: dict[str, Any]):
                 active = current["status"] in ("queued", "running")
@@ -1201,16 +1271,22 @@ def build_app():
             return ft.Column(
                 controls=[
                     ft.Text("更新任务", size=18, weight=ft.FontWeight.BOLD),
-                    ft.Text(f"参照公司：{job['anchor']}"),
+                    ft.Text(
+                        f"固定关注范围（{len(job['codes'])}家）：{', '.join(job['codes'])}"
+                        if is_watch
+                        else f"参照公司：{job['anchor']}"
+                    ),
                     status_text,
                     result_button,
                     retry_button,
                     remove_button,
                     ft.Text(
-                        "重新扫描须再次点击查找同业，按届时清单与已证明日历确定范围和目标日；不会更改原任务。",
+                        "查看关注最新资料可能包含后续更新，不代表此任务的历史快照。再次更新须回首页确认，按届时未暂停清单和已证明日期冻结新范围；原任务不变。"
+                        if is_watch
+                        else "重新扫描须再次点击查找同业，按届时清单与已证明日历确定范围和目标日；不会更改原任务。",
                         size=12,
                     ),
-                    ft.Button("返回同业发现", on_click=retry),
+                    ft.Button("返回我的关注" if is_watch else "返回同业发现", on_click=retry),
                 ]
             )
 
@@ -1647,6 +1723,14 @@ def build_app():
 
             follow_btn.on_click = follow
             insights = ctx.get("fact_insights") or {}
+            peer_rank = ctx.get("peer_rank")
+            identity_notice = (
+                "最新基础信息：退市或暂停上市，请核查；个人记录不会删除。"
+                if ctx.get("latest_listing_status") in ("D", "P")
+                else ""
+            )
+            if ctx.get("latest_risk_status") == "known_warning":
+                identity_notice += " 名称含ST风险警示，仍可查看可得事实，不代表风险已解除。"
             return ft.Column(
                 controls=[
                     ft.Row(
@@ -1688,7 +1772,18 @@ def build_app():
                             padding=12,
                             content=ft.Column(
                                 controls=[
-                                    ft.Text("公司筛选事实", size=15, weight=ft.FontWeight.BOLD),
+                                    ft.Text(
+                                        "公司资料事实"
+                                        if ctx.get("displayed_kind") == "watch"
+                                        else "公司筛选事实",
+                                        size=15,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    *(
+                                        [ft.Text(identity_notice, color=ft.Colors.RED_900)]
+                                        if identity_notice
+                                        else []
+                                    ),
                                     ft.Text(
                                         f"PB: {usable.get('pb', '无')} (估值日: {ctx.get('usable_valuation_date', '无')})",
                                         size=14,
@@ -1706,7 +1801,15 @@ def build_app():
                                         insights.get("roe_trend", "ROE趋势：资料有缺口，暂不判断")
                                     ),
                                     ft.Text(
-                                        "统计范围：本次沪深主板非金融、TuShare同行业合格样本，最多50家，偏向大市值；行业标签不证明业务可比。",
+                                        "本次为固定关注事实更新，不重新选择同业、不生成新名次；PB中位数不适用。"
+                                        if ctx.get("displayed_kind") == "watch"
+                                        else "统计范围：本次沪深主板非金融、TuShare同行业合格样本，最多50家，偏向大市值；行业标签不证明业务可比。",
+                                        size=12,
+                                    ),
+                                    ft.Text(
+                                        f"最近同业名次：{peer_rank['position']}（参照{peer_rank['anchor']}，估值日{peer_rank['valuation_date']}）；固定关注更新不改变此历史名次。"
+                                        if peer_rank
+                                        else "暂无可用同业名次；固定关注更新不生成名次。",
                                         size=12,
                                     ),
                                     ft.Container(

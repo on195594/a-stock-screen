@@ -32,6 +32,7 @@ from workspace import (
     get_run,
     get_watch_item,
     is_row_usable,
+    latest_watch_failure,
     list_runs,
     list_watch_items,
     mark_watch_ack,
@@ -455,6 +456,15 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     if usable_run
                     else "最新快照文件损坏或无法读取"
                 )
+            elif latest_watch_failure(
+                conn, code, latest_run["captured_at"] if latest_run else None
+            ):
+                has_change = True
+                change_summary = (
+                    "最近固定关注更新未完成，仍展示上次可用资料；请查看最近更新"
+                    if usable_run
+                    else "最近固定关注更新未完成，暂无可用事实；请查看最近更新"
+                )
             elif regression:
                 has_change = True
                 change_summary = "最新运行估值日倒退异常，仍展示上次可用资料"
@@ -693,6 +703,9 @@ def get_company_context(
             "updated_at": watch_item.get("updated_at") if watch_item else None,
             "ack_run_id": watch_item.get("ack_run_id") if watch_item else None,
             "displayed_run_id": usable_fact_run.get("run_id") if usable_fact_run else None,
+            "displayed_kind": usable_fact_run.get("kind") if usable_fact_run else None,
+            "latest_listing_status": (latest_attempt_row or {}).get("list_status"),
+            "latest_risk_status": (latest_attempt_row or {}).get("risk_status"),
             "usable_fact": usable_fact_data,
             "fact_insights": fact_insights,
             "usable_valuation_date": usable_fact_run.get("valuation_date")
@@ -721,6 +734,22 @@ def get_company_context(
             "peer_rank": last_peer_rank,
         }
 
+        failed_job = latest_watch_failure(
+            conn, code, latest_attempt_run["captured_at"] if latest_attempt_run else None
+        )
+        if failed_job:
+            context.update(
+                latest_attempt_job_id=failed_job["job_id"],
+                latest_attempt_run_id=None,
+                latest_attempt_date=json.loads(failed_job["payload_json"])["target_date"],
+                latest_attempt_status="failed",
+                latest_attempt_error=(
+                    "最近固定关注更新未完成；以下为旧可用资料，不可确认为本次已阅"
+                    if usable_fact_run
+                    else "最近固定关注更新未完成；暂无可用资料，不可确认为本次已阅"
+                ),
+                has_latest_attempt_gap=True,
+            )
         context["comparison"] = _company_comparison(
             conn, state_dir, code, context["displayed_run_id"], context["ack_run_id"]
         )
@@ -1237,6 +1266,7 @@ def _job_summary(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         "kind": row["kind"],
         "anchor": payload.get("anchor"),
         "target_date": payload.get("target_date"),
+        "codes": payload.get("codes", []),
         "status": row["status"],
         "phase": row["phase"],
         "requested_at": row["requested_at"],
@@ -1256,6 +1286,31 @@ def request_peer_update(
     tracker_root: Path | None = None,
 ) -> dict[str, Any]:
     """Freeze a user-clicked peer scan. Network access belongs only to worker.py."""
+    if not isinstance(anchor, str):
+        check_actor(actor)
+        raise ServiceError("无效参照公司")
+    return _request_update(actor, anchor, request_id, state_dir, mode, tracker_root)
+
+
+def request_watch_update(
+    actor: Actor,
+    request_id: str,
+    state_dir: Path,
+    mode: Mode,
+    tracker_root: Path | None = None,
+) -> dict[str, Any]:
+    """Freeze nonpaused personal codes, never the tracker pool or a peer ranking."""
+    return _request_update(actor, None, request_id, state_dir, mode, tracker_root)
+
+
+def _request_update(
+    actor: Actor,
+    anchor: str | None,
+    request_id: str,
+    state_dir: Path,
+    mode: Mode,
+    tracker_root: Path | None,
+) -> dict[str, Any]:
     check_actor(actor)
     if (
         not request_id
@@ -1263,7 +1318,8 @@ def request_peer_update(
         or not all(c.isascii() and (c.isalnum() or c in "_-") for c in request_id)
     ):
         raise ServiceError("无效请求编号")
-    intent = {"kind": "peer", "anchor": anchor}
+    kind = "watch" if anchor is None else "peer"
+    intent = {"kind": kind} if kind == "watch" else {"kind": kind, "anchor": anchor}
     try:
         conn = connect_workspace(state_dir, mode)
         try:
@@ -1280,16 +1336,30 @@ def request_peer_update(
                 conn.commit()
                 return _job_summary(existing)
 
-            watchlist = peer_anchors(actor, tracker_root, mode)
-            if anchor not in {item["code"] for item in watchlist}:
-                raise ServiceError("参照公司不在允许范围内")
+            if kind == "watch":
+                codes = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT code FROM watch_items WHERE status != 'paused' ORDER BY code"
+                    )
+                ]
+                if not codes:
+                    raise ServiceError("没有未暂停的关注公司，请先关注或恢复公司")
+                if len(codes) > 50:
+                    raise ServiceError("未暂停关注超过50家，请先暂停部分公司；不会静默截断")
+                scope = {"codes": codes}
+            else:
+                watchlist = peer_anchors(actor, tracker_root, mode)
+                if anchor not in {item["code"] for item in watchlist}:
+                    raise ServiceError("参照公司不在允许范围内")
+                scope = {"watchlist": watchlist}
             target_date = _peer_target_date(tracker_root, mode)
             payload: dict[str, Any] = {
                 "intent": intent,
                 "anchor": anchor,
                 "target_date": target_date,
-                "rule_id": "peer-screen-v1",
-                "watchlist": watchlist,
+                "rule_id": "peer-screen-v1" if kind == "peer" else None,
+                **scope,
             }
             dedupe_key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             payload["intent_hash"] = dedupe_key
@@ -1318,7 +1388,7 @@ def request_peer_update(
                 """INSERT INTO update_jobs
                 (job_id,request_id,kind,payload_json,dedupe_key,status,requested_at,updated_at)
                 VALUES (?,?,?,?,?,'queued',?,?)""",
-                (job_id, request_id, "peer", json.dumps(payload), dedupe_key, now, now),
+                (job_id, request_id, kind, json.dumps(payload), dedupe_key, now, now),
             )
             check_actor(actor)
             conn.commit()
