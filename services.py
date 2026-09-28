@@ -1315,12 +1315,16 @@ def _peer_target_date(tracker_root: Path | None, mode: Mode) -> str:
         if (
             not str(calendar.get("source", "")).startswith("tushare.trade_cal:SSE;")
             or start > yesterday
-            or end < yesterday
-            or as_of < yesterday
         ):
             raise ValueError("calendar coverage is stale")
+        proved_end = min(end, as_of)
+        uncovered = [
+            proved_end + timedelta(days=i) for i in range(1, (yesterday - proved_end).days + 1)
+        ]
+        if any(day.weekday() < 5 for day in uncovered):
+            raise ValueError("calendar coverage is stale")
         trading_days = [date.fromisoformat(day) for day in calendar["dates"]]
-        if not trading_days or any(day < start or day > min(end, as_of) for day in trading_days):
+        if not trading_days or any(day < start or day > proved_end for day in trading_days):
             raise ValueError("calendar dates exceed proved coverage")
         completed = [day for day in trading_days if day <= yesterday]
         if not completed:

@@ -2554,7 +2554,7 @@ def test_home_change_tier_classification(tmp_path: Path) -> None:
     # 600004: first-time review with healthy usable facts in v1 -> fact_change
     save_watch(actor, "600004.SH", first, {}, 0, tmp_path, "demo")
 
-    # Import second fixture (2026-09-21) where 600002 keeps PB=1.15 to test pure date_change
+    # Import second fixture (2026-09-21) where scope changes (fact_change)
     v2_data = json.loads((FIXTURES_DIR / "peer_second_change.json").read_text())
     v2_data["rows"][1]["pb"] = 1.15
     v2_file = tmp_path / "v2_test.json"
@@ -2584,3 +2584,47 @@ def test_home_change_tier_classification(tmp_path: Path) -> None:
     items_err = {it["code"]: it for it in home_err["watch_items"]}
     assert items_err["600002.SH"]["change_tier"] == "anomaly"
     assert "最近固定关注更新未完成" in items_err["600002.SH"]["change_summary"]
+
+
+def test_peer_target_date_allows_weekend_gap_without_stale_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from services import _peer_target_date
+
+    tracker = tmp_path / "tracker"
+    (tracker / "data").mkdir(parents=True)
+    calendar_file = tracker / "data" / "trading_calendar.json"
+    calendar_data = {
+        "source": "tushare.trade_cal:SSE;test",
+        "covered_from": "2026-01-01",
+        "covered_to": "2026-09-25",  # Friday
+        "as_of": "2026-09-25",
+        "dates": ["2026-09-23", "2026-09-24"],
+    }
+    calendar_file.write_text(json.dumps(calendar_data), encoding="utf-8")
+
+    class MockDatetime(datetime):
+        current = datetime(2026, 9, 28, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai"))  # Monday
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr("services.datetime", MockDatetime)
+
+    # On Monday, yesterday is Sunday 2026-09-27. Saturday & Sunday are weekends.
+    # Should resolve to 2026-09-24 without error.
+    assert _peer_target_date(tracker, "production") == "2026-09-24"
+
+    # On Sunday, yesterday is Saturday 2026-09-26 (weekend).
+    MockDatetime.current = datetime(2026, 9, 27, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert _peer_target_date(tracker, "production") == "2026-09-24"
+
+    # On Tuesday (2026-09-29), yesterday is Monday 2026-09-28 (a weekday).
+    # Since Monday was not covered by the Friday calendar, it should raise ServiceError.
+    MockDatetime.current = datetime(2026, 9, 29, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    with pytest.raises(ServiceError, match="交易日历缺失或未覆盖昨日"):
+        _peer_target_date(tracker, "production")
