@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -84,7 +85,7 @@ def build_app():
         # State per page session
         page_state: dict[str, Any] = {
             "actor": create_demo_actor() if APP_MODE == "demo" else None,
-            "route": "/" if APP_MODE == "demo" else "/login",
+            "route": (page.route or "/") if APP_MODE == "demo" else "/login",
             "selected_anchor": "600001.SH",
             "generation": 0,
             "drafts": {},
@@ -92,7 +93,7 @@ def build_app():
             "current_company_code": None,
             "current_form_baseline": None,
             "job_poll_task": None,
-            "pending_peer_request": None,
+            "pending_updates": {},
             "connected": True,
             "company_return": "/",
             "scroll_positions": {},
@@ -100,7 +101,10 @@ def build_app():
         }
 
         # Explicit logout in settings handles actor revocation
-        content_container = ft.Container(expand=True)
+        loading_content = ft.Column(
+            [ft.ProgressRing(width=24, height=24), ft.Text("正在读取资料，请稍候…")]
+        )
+        content_container = ft.Container(content=loading_content, expand=True)
         login_msg = ft.Text("", size=13, color=ft.Colors.RED_700)
 
         def remember_draft() -> None:
@@ -128,8 +132,7 @@ def build_app():
                 drafts.pop(code, None)
 
         async def navigate(route: str, *, from_browser: bool = False):
-            if page_state.pop("removal_dialog", False):
-                page.pop_dialog()
+            page.pop_dialog()  # A dialog belongs to its view, not a later route.
             getter = page_state.get("current_form_getter")
             actor = page_state.get("actor")
             if (
@@ -193,11 +196,15 @@ def build_app():
             page_state["current_form_getter"] = None
             page_state["current_company_code"] = None
             page_state["current_form_baseline"] = None
+            gen = page_state["generation"]
             if not from_browser:
                 await page.push_route(route)
+            if gen != page_state["generation"] or not page_state["connected"]:
+                return
             await render_current_view()
-            page.update()
-            await page.scroll_to(offset=restore_offset, duration=0)
+            if gen == page_state["generation"] and page_state["connected"]:
+                page.update()
+                await page.scroll_to(offset=restore_offset, duration=0)
 
         async def on_route_change(e):
             if e.route != page_state["route"]:
@@ -309,7 +316,6 @@ def build_app():
                     nonlocal closed
                     if live() and not busy:
                         closed = True
-                        page_state.pop("removal_dialog", None)
                         page.pop_dialog()
 
                 async def confirm(e):
@@ -339,7 +345,6 @@ def build_app():
                     )
                     await navigate("/")
 
-                page_state["removal_dialog"] = True
                 page.show_dialog(
                     ft.AlertDialog(
                         modal=True,
@@ -380,6 +385,67 @@ def build_app():
                 spacing=16,
             )
 
+        pending_message = "上次提交尚未确认；可先查看最近任务，或重试确认（复用原请求编号）。"
+
+        async def submit_update(
+            anchor: str | None,
+            button: ft.Button | ft.TextButton,
+            feedback: ft.Text,
+            gen: int,
+            actor: Actor,
+        ) -> dict[str, Any] | None:
+            def live() -> bool:
+                return (
+                    gen == page_state["generation"] and actor.is_valid and page_state["connected"]
+                )
+
+            if not live() or button.disabled:
+                return None
+            button.disabled = True
+            feedback.value = "正在确认是否受理，请勿重复提交；离开页面不会取消已受理任务。"
+            feedback.color = ft.Colors.BLUE_GREY_700
+            page.update()
+            pending = page_state["pending_updates"]
+            request_id = pending.setdefault(anchor, uuid.uuid4().hex)
+            try:
+                if anchor is None:
+                    job = await asyncio.to_thread(
+                        request_watch_update, actor, request_id, STATE_DIR, APP_MODE, TRACKER_ROOT
+                    )
+                else:
+                    job = await asyncio.to_thread(
+                        request_peer_update,
+                        actor,
+                        anchor,
+                        request_id,
+                        STATE_DIR,
+                        APP_MODE,
+                        TRACKER_ROOT,
+                    )
+            except (ServiceError, WorkspaceError, AuthError) as exc:
+                message = (
+                    f"未取得受理回执：{exc}。可查看最近任务，处理阻断后重试确认（复用原请求编号）。"
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Update receipt unavailable (%s)", type(exc).__name__
+                )
+                message = "提交结果未确认，可能已受理。可查看最近任务，或重试确认（复用原请求编号），不会自动重放。"
+            else:
+                if live():
+                    if pending.get(anchor) == request_id:
+                        pending.pop(anchor)
+                    feedback.value = "请求已受理，正在打开任务。"
+                    return job
+                # Keep the ID for a returning page to resolve, never silently start anew.
+                return None
+            if live():
+                feedback.value = message
+                feedback.color = ft.Colors.RED_700
+                button.disabled = False
+                page.update()
+            return None
+
         async def render_home(gen: int):
             actor: Actor | None = page_state.get("actor")
             if not actor or not actor.is_valid:
@@ -393,51 +459,17 @@ def build_app():
                 return await render_login()
             items_controls: list[ft.Control] = []
             paused_controls: list[ft.Control] = []
-            status_feedback = ft.Text("", color=ft.Colors.RED_700)
+            status_feedback = ft.Text(
+                pending_message if None in page_state["pending_updates"] else "",
+                color=ft.Colors.RED_700,
+            )
             active_count = sum(item["status"] != "paused" for item in data["watch_items"])
             update_button = ft.Button("更新资料", disabled=not 0 < active_count <= 50)
 
             async def submit_watch(e):
-                if (
-                    gen != page_state["generation"]
-                    or not actor.is_valid
-                    or not page_state["connected"]
-                    or update_button.disabled
-                ):
-                    return
-                update_button.disabled = True
-                page.update()
-                request_id = page_state.setdefault("pending_watch_request", uuid.uuid4().hex)
-                try:
-                    job = await asyncio.to_thread(
-                        request_watch_update, actor, request_id, STATE_DIR, APP_MODE, TRACKER_ROOT
-                    )
-                    if page_state.get("pending_watch_request") == request_id:
-                        page_state.pop("pending_watch_request", None)
-                    if (
-                        gen == page_state["generation"]
-                        and actor.is_valid
-                        and page_state["connected"]
-                    ):
-                        await navigate(f"/jobs/{job['job_id']}")
-                except (ServiceError, WorkspaceError, AuthError) as exc:
-                    if (
-                        gen == page_state["generation"]
-                        and actor.is_valid
-                        and page_state["connected"]
-                    ):
-                        status_feedback.value = str(exc)
-                        update_button.disabled = False
-                        page.update()
-                except Exception:
-                    if (
-                        gen == page_state["generation"]
-                        and actor.is_valid
-                        and page_state["connected"]
-                    ):
-                        status_feedback.value = "提交结果未确认；返回首页查看最近更新。再次提交会先查询原请求，不会自动重放。"
-                        update_button.disabled = False
-                        page.update()
+                job = await submit_update(None, update_button, status_feedback, gen, actor)
+                if job:
+                    await navigate(f"/jobs/{job['job_id']}")
 
             update_button.on_click = submit_watch
             last_group = None
@@ -756,7 +788,8 @@ def build_app():
                                             f"估值基准日：{data['valuation_date']} | 需要复看：{data['needs_review_count']} 家",
                                             size=13,
                                         ),
-                                    ]
+                                    ],
+                                    expand=True,
                                 ),
                                 update_button,
                             ],
@@ -836,9 +869,13 @@ def build_app():
                 return await render_login()
 
             async def on_anchor_select(e):
-                if actor.is_valid and anchor_field.value in codes:
+                if (
+                    gen == page_state["generation"]
+                    and actor.is_valid
+                    and page_state["connected"]
+                    and anchor_field.value in codes
+                ):
                     page_state["selected_anchor"] = anchor_field.value
-                    page_state["pending_peer_request"] = None
                     await navigate("/discover?" + urlencode({"anchor": anchor_field.value}))
 
             anchor_field = ft.Dropdown(
@@ -851,50 +888,16 @@ def build_app():
                 on_select=on_anchor_select,
                 disabled=not allowed,
             )
-            update_feedback = ft.Text("", color=ft.Colors.RED_700)
+            update_feedback = ft.Text(
+                pending_message if anchor in page_state["pending_updates"] else "",
+                color=ft.Colors.RED_700,
+            )
             submit_button = ft.Button("查找同业", disabled=anchor not in codes)
 
             async def on_submit(e):
-                if (
-                    submit_button.disabled
-                    or gen != page_state["generation"]
-                    or not actor.is_valid
-                    or not page_state["connected"]
-                ):
-                    return
-                submit_button.disabled = True
-                page.update()
-                pending = page_state.get("pending_peer_request")
-                if not pending or pending["anchor"] != anchor:
-                    pending = {"anchor": anchor, "request_id": uuid.uuid4().hex}
-                    page_state["pending_peer_request"] = pending
-                try:
-                    job = await asyncio.to_thread(
-                        request_peer_update,
-                        actor,
-                        anchor,
-                        pending["request_id"],
-                        STATE_DIR,
-                        APP_MODE,
-                        TRACKER_ROOT,
-                    )
-                    if page_state.get("pending_peer_request") is pending:
-                        page_state["pending_peer_request"] = None
-                    if (
-                        gen == page_state["generation"]
-                        and actor.is_valid
-                        and page_state["connected"]
-                    ):
-                        await navigate(f"/jobs/{job['job_id']}")
-                except (ServiceError, WorkspaceError, AuthError) as exc:
-                    if (
-                        gen == page_state["generation"]
-                        and actor.is_valid
-                        and page_state["connected"]
-                    ):
-                        update_feedback.value = str(exc)
-                        submit_button.disabled = False
-                        page.update()
+                job = await submit_update(anchor, submit_button, update_feedback, gen, actor)
+                if job:
+                    await navigate(f"/jobs/{job['job_id']}")
 
             submit_button.on_click = on_submit
 
@@ -1320,11 +1323,9 @@ def build_app():
                 ):
                     return
                 if job["kind"] == "watch":
-                    page_state.pop("pending_watch_request", None)
                     await navigate("/")
                     return
                 page_state["selected_anchor"] = job["anchor"]
-                page_state["pending_peer_request"] = None
                 await go_discover(e)
 
             async def retry(e):
@@ -1337,64 +1338,29 @@ def build_app():
                 if job["kind"] == "watch":
                     await return_to_discover(e)
                     return
-                busy = False
                 dialog_open = True
 
                 async def cancel(e):
                     nonlocal dialog_open
-                    if not busy and gen == page_state["generation"] and page_state["connected"]:
+                    if (
+                        not confirm_button.disabled
+                        and gen == page_state["generation"]
+                        and page_state["connected"]
+                    ):
                         dialog_open = False
                         page.pop_dialog()
 
                 async def confirm(e):
-                    nonlocal busy, dialog_open
-                    if (
-                        not dialog_open
-                        or busy
-                        or gen != page_state["generation"]
-                        or not actor.is_valid
-                        or not page_state["connected"]
-                    ):
+                    nonlocal dialog_open
+                    if not dialog_open:
                         return
-                    busy = True
-                    confirm_button.disabled = True
-                    page.update()
-                    pending = page_state.get("pending_peer_request")
-                    if not pending or pending["anchor"] != job["anchor"]:
-                        pending = {"anchor": job["anchor"], "request_id": uuid.uuid4().hex}
-                        page_state["pending_peer_request"] = pending
-                    try:
-                        submitted = await asyncio.to_thread(
-                            request_peer_update,
-                            actor,
-                            job["anchor"],
-                            pending["request_id"],
-                            STATE_DIR,
-                            APP_MODE,
-                            TRACKER_ROOT,
-                        )
-                        if page_state.get("pending_peer_request") is pending:
-                            page_state["pending_peer_request"] = None
-                        if (
-                            gen == page_state["generation"]
-                            and actor.is_valid
-                            and page_state["connected"]
-                        ):
-                            dialog_open = False
-                            page.pop_dialog()
-                            await navigate(f"/jobs/{submitted['job_id']}")
-                    except (ServiceError, WorkspaceError, AuthError) as exc:
-                        if (
-                            gen == page_state["generation"]
-                            and actor.is_valid
-                            and page_state["connected"]
-                        ):
-                            feedback.value = (
-                                f"提交未确认：{exc}。可重试确认，同一请求不会重复执行。"
-                            )
-                            busy = False
-                            confirm_button.disabled = False
-                            page.update()
+                    submitted = await submit_update(
+                        job["anchor"], confirm_button, feedback, gen, actor
+                    )
+                    if submitted:
+                        dialog_open = False
+                        page.pop_dialog()
+                        await navigate(f"/jobs/{submitted['job_id']}")
 
                 feedback = ft.Text("", color=ft.Colors.RED_700)
                 confirm_button = ft.TextButton("确认重新扫描", on_click=confirm)
@@ -2217,23 +2183,52 @@ def build_app():
                 )
                 else 0
             )
-            if route == "/login":
-                content = await render_login()
-            elif route == "/":
-                content = await render_home(gen)
-            elif route == "/discover":
-                content = await render_discover(gen)
-            elif route.startswith("/jobs/"):
-                content = await render_job(route.rsplit("/", 1)[-1], gen)
-            elif route.startswith("/company/"):
-                c = route.split("/")[-1]
-                content = await render_company(c, gen)
-            elif route == "/settings":
-                content = await render_settings()
-            else:
-                content = await render_login()
+            if not page_state["connected"]:
+                return
+            if content_container.content is not loading_content:
+                content_container.content = loading_content
+                page.update()
+            try:
+                if route == "/login":
+                    content = await render_login()
+                elif route == "/":
+                    content = await render_home(gen)
+                elif route == "/discover":
+                    content = await render_discover(gen)
+                elif route.startswith("/jobs/"):
+                    content = await render_job(route.rsplit("/", 1)[-1], gen)
+                elif route.startswith("/company/"):
+                    content = await render_company(route.split("/")[-1], gen)
+                elif route == "/settings":
+                    content = await render_settings()
+                else:
+                    content = await render_login()
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Page read unavailable (%s)", type(exc).__name__
+                )
 
-            if gen == page_state["generation"]:
+                async def retry_read(e):
+                    if (
+                        gen == page_state["generation"]
+                        and actor
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        await render_current_view()
+                        page.update()
+
+                content = ft.Column(
+                    [
+                        ft.Text("暂时无法读取资料；已保存内容不会因此删除。"),
+                        ft.Text(
+                            "可重新读取或返回我的关注查看最近任务；只读取资料，不会提交或重放更新。"
+                        ),
+                        ft.Button("重新读取", on_click=retry_read),
+                    ]
+                )
+
+            if gen == page_state["generation"] and page_state["connected"]:
                 if route != "/login" and (not actor or not actor.is_valid):
                     page_state["route"] = "/login"
                     content = await render_login()
@@ -2341,6 +2336,7 @@ def build_app():
         async def on_connect(e):
             nonlocal watchdog_task
             page_state["connected"] = True
+            page.pop_dialog()  # Old confirmation callbacks have an expired generation.
             if watchdog_task is None or watchdog_task.done():
                 watchdog_task = asyncio.create_task(session_watchdog())
             actor: Actor | None = page_state.get("actor")

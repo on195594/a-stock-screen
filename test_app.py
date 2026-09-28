@@ -349,8 +349,11 @@ def test_empty_home_entry_expires_with_page(tmp_path, monkeypatch, invalidate):
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("invalidate", ["navigation", "disconnect", "revocation", "uncertain"])
-def test_watch_submit_lifecycle_and_uncertain_receipt(tmp_path, monkeypatch, invalidate):
+@pytest.mark.parametrize("kind", ["peer", "watch"])
+@pytest.mark.parametrize(
+    "invalidate", ["navigation", "disconnect", "revocation", "uncertain", "blocked"]
+)
+def test_update_submit_lifecycle_and_uncertain_receipt(tmp_path, monkeypatch, invalidate, kind):
     initialize(tmp_path, "demo", journal_mode="DELETE")
     monkeypatch.setattr(app, "APP_MODE", "demo")
     monkeypatch.setattr(app, "STATE_DIR", tmp_path)
@@ -360,25 +363,31 @@ def test_watch_submit_lifecycle_and_uncertain_receipt(tmp_path, monkeypatch, inv
         tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
     )
     app.save_watch(actor, "600001.SH", run, {}, 0, tmp_path, "demo")
-    real_submit = app.request_watch_update
+    service_name = f"request_{kind}_update"
+    real_submit = getattr(app, service_name)
     calls = []
 
     def uncertain(*args):
-        calls.append(args[1])
+        calls.append(args[1 if kind == "watch" else 2])
+        if invalidate == "blocked":
+            raise app.ServiceError("交易日历缺失或未覆盖昨日；旧资料仍可查看，本次不提交更新")
         result = real_submit(*args)
         if len(calls) == 1:
             raise TimeoutError("synthetic receipt lost")
         return result
 
-    monkeypatch.setattr(app, "request_watch_update", uncertain)
+    monkeypatch.setattr(app, service_name, uncertain)
 
     async def check():
         page = AppMockPage()
         await app.build_app()(page)
+        if kind == "peer":
+            await page.on_route_change(SimpleNamespace(route="/discover"))
         button = next(
             c
             for c in app_controls(page.controls[0])
-            if isinstance(c, ft.Button) and c.content == "更新资料"
+            if isinstance(c, ft.Button)
+            and c.content == ("更新资料" if kind == "watch" else "查找同业")
         )
         if invalidate == "navigation":
             await page.on_route_change(SimpleNamespace(route="/settings"))
@@ -397,7 +406,14 @@ def test_watch_submit_lifecycle_and_uncertain_receipt(tmp_path, monkeypatch, inv
             await button.on_click(None)
             assert calls[0] == calls[1] and page.route.startswith("/jobs/")
             texts = [c.value for c in app_controls(page.controls[0]) if isinstance(c, ft.Text)]
-            assert any("固定关注范围（1家）：600001.SH" in t for t in texts)
+            assert any(
+                ("固定关注范围（1家）：600001.SH" if kind == "watch" else "600001.SH") in t
+                for t in texts
+            )
+        elif invalidate == "blocked":
+            assert not button.disabled and len(calls) == 1
+            texts = [c.value for c in app_controls(page.controls[0]) if isinstance(c, ft.Text)]
+            assert any("本次不提交更新" in text and "复用原请求编号" in text for text in texts)
         else:
             assert not calls
         with connect_workspace(tmp_path, "demo") as conn:
@@ -526,7 +542,12 @@ def test_home_shell_renders_before_slow_data_read(tmp_path, monkeypatch):
             assert await asyncio.to_thread(started.wait, 3)
             assert page.updated_count == 1
             assert page.navigation_bar is not None
-            assert page.controls  # Header is already pushed while SQLite read is pending.
+            assert page.controls  # Header and loading feedback precede the SQLite read.
+            assert any(
+                "正在读取资料" in c.value
+                for c in app_controls(page.controls[0])
+                if isinstance(c, ft.Text)
+            )
         finally:
             release.set()
         await asyncio.wait_for(task, timeout=5)
@@ -1470,7 +1491,7 @@ def test_peer_rescan_confirmation_submits_task(tmp_path, monkeypatch, outcome):
         requests.append(args[2])
         result = request_peer_update(*args)
         if outcome == "uncertain" and len(requests) == 1:
-            raise app.ServiceError("synthetic lost receipt")
+            raise TimeoutError("synthetic lost receipt")
         return result
 
     monkeypatch.setattr(app, "request_peer_update", submit)
@@ -1491,8 +1512,11 @@ def test_peer_rescan_confirmation_submits_task(tmp_path, monkeypatch, outcome):
             await page.dialog.actions[0].on_click(None)
         elif outcome == "navigation":
             await page.on_route_change(SimpleNamespace(route="/settings"))
+            assert page.dialog is None
         elif outcome == "disconnect":
             await page.on_disconnect(None)
+            await page.on_connect(None)
+            assert page.dialog is None
         elif outcome == "revocation":
             actor.revoke()
         await confirm.on_click(None)
@@ -1736,6 +1760,184 @@ def test_stale_editor_cannot_replace_reconnected_draft(tmp_path, monkeypatch):
         await page.on_disconnect(None)
         await page.on_connect(None)
         assert reason_field().value == "保留的草稿"
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("kind", ["peer", "watch"])
+@pytest.mark.parametrize("leave", ["navigation", "disconnect"])
+def test_inflight_receipt_survives_return_without_new_request(tmp_path, monkeypatch, kind, leave):
+    from worker import run_worker
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    run = import_snapshot(
+        tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
+    )
+    app.save_watch(app.create_demo_actor(), "600001.SH", run, {}, 0, tmp_path, "demo")
+    service = getattr(app, f"request_{kind}_update")
+    to_thread = asyncio.to_thread
+    calls = []
+
+    async def check():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed(func, *args, **kwargs):
+            result = await to_thread(func, *args, **kwargs)
+            if func is service:
+                calls.append(args[1 if kind == "watch" else 2])
+                started.set()
+                await release.wait()
+            return result
+
+        monkeypatch.setattr(asyncio, "to_thread", delayed)
+        page = AppMockPage()
+        await app.build_app()(page)
+        route = "/" if kind == "watch" else "/discover"
+        if kind == "peer":
+            await page.on_route_change(SimpleNamespace(route=route))
+
+        def submit_button():
+            return next(
+                c
+                for c in app_controls(page.controls[0])
+                if isinstance(c, ft.Button)
+                and c.content == ("更新资料" if kind == "watch" else "查找同业")
+            )
+
+        button = submit_button()
+        inflight = asyncio.create_task(button.on_click(None))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            await button.on_click(None)  # Double click never starts another call.
+            assert len(calls) == 1
+            if leave == "navigation":
+                await page.on_route_change(SimpleNamespace(route="/settings"))
+            else:
+                await page.on_disconnect(None)
+                await page.on_connect(None)
+        finally:
+            release.set()
+        await inflight
+        assert not page.route.startswith("/jobs/")
+        # A completed job no longer benefits from active-scope deduplication.
+        run_worker(tmp_path, "demo", None, once=True)  # Synthetic, main thread for signal setup.
+        if leave == "navigation":
+            await page.on_route_change(SimpleNamespace(route=route))
+        assert any(
+            "上次提交尚未确认" in c.value
+            for c in app_controls(page.controls[0])
+            if isinstance(c, ft.Text)
+        )
+        await submit_button().on_click(None)
+        assert len(calls) == 2 and calls[0] == calls[1]
+        assert page.route.startswith("/jobs/")
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
+def test_late_read_cannot_replace_new_view_or_its_scroll(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    to_thread = asyncio.to_thread
+
+    async def check():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed(func, *args, **kwargs):
+            if func is app.get_company_context:
+                started.set()
+                await release.wait()
+            return await to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", delayed)
+        page = AppMockPage()
+        await app.build_app()(page)
+        await page.on_route_change(SimpleNamespace(route="/settings"))
+        page.views[0].on_scroll(SimpleNamespace(pixels=120))
+        await page.on_route_change(SimpleNamespace(route="/"))
+        old_read = asyncio.create_task(
+            page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        )
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert any(
+                "正在读取资料" in c.value
+                for c in app_controls(page.controls[0])
+                if isinstance(c, ft.Text)
+            )
+            await page.on_route_change(SimpleNamespace(route="/settings"))
+        finally:
+            release.set()
+        await old_read
+        texts = [c.value for c in app_controls(page.controls[0]) if isinstance(c, ft.Text)]
+        assert "账户与运行信息" in texts and "公司筛选事实" not in texts
+        assert page.scroll_offset == 120
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("mode", ["demo", "production"])
+def test_initial_deep_link_keeps_demo_context_but_requires_production_login(
+    tmp_path, monkeypatch, mode
+):
+    initialize(tmp_path, mode, journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", mode)
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+
+    async def check():
+        page = AppMockPage()
+        page.route = "/company/600001.SH"
+        await app.build_app()(page)
+        controls = list(app_controls(page.controls[0]))
+        if mode == "demo":
+            assert any(isinstance(c, ft.Text) and c.value == "公司筛选事实" for c in controls)
+        else:
+            assert any(
+                isinstance(c, ft.Button) and c.content == "使用 GitHub 登录" for c in controls
+            )
+            assert not any(isinstance(c, ft.TextField) for c in controls)
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
+def test_read_failure_has_safe_retry_without_submitting(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    real_home = app.get_home
+    calls = []
+
+    def fail_once(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("synthetic private diagnostic must not reach browser")
+        return real_home(*args)
+
+    monkeypatch.setattr(app, "get_home", fail_once)
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        controls = list(app_controls(page.controls[0]))
+        texts = [c.value for c in controls if isinstance(c, ft.Text)]
+        assert any("暂时无法读取" in text for text in texts)
+        assert not any("private diagnostic" in text for text in texts)
+        retry = next(c for c in controls if isinstance(c, ft.Button) and c.content == "重新读取")
+        await retry.on_click(None)
+        assert any(
+            "暂无关注" in c.value for c in app_controls(page.controls[0]) if isinstance(c, ft.Text)
+        )
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 0
         await page.on_close(None)
 
     asyncio.run(check())

@@ -1,9 +1,11 @@
 """Mobile end-to-end browser smoke test with isolated temporary demo workspace."""
 
+import argparse
 import json
 import os
 import re
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -18,7 +20,7 @@ from urllib.parse import urlparse
 from workspace import import_snapshot
 
 FIXTURES_DIR = Path(__file__).parent / "tests" / "fixtures"
-SCREENSHOT_PATH = Path("/tmp/mobile_test_failure.png")
+SCREENSHOT_PATH = Path(f"/tmp/mobile_test_failure_{time.time_ns()}.png")
 
 # Ensure localhost traffic does not hit corporate or sandbox proxies
 os.environ["no_proxy"] = "127.0.0.1,localhost"
@@ -41,7 +43,133 @@ def wait_for_server(url: str, timeout_sec: int = 15) -> bool:
     return False
 
 
-def main() -> int:
+def click_settled(page, control):
+    """Wait for Flutter's semantic scroll geometry; never force a hidden hit target."""
+    control.scroll_into_view_if_needed()
+    handle = control.element_handle()
+    page.wait_for_function(
+        """el => {
+        const r = el.getBoundingClientRect();
+        const geometry = [r.x, r.y, r.width, r.height].join(',');
+        if (el._testGeometry !== geometry) {
+            el._testGeometry = geometry;
+            el._testStableSince = performance.now();
+        }
+        return performance.now() - el._testStableSince >= 250;
+    }""",
+        arg=handle,
+        timeout=5000,
+    )
+    box = control.bounding_box()
+    footer = page.get_by_role("tablist").bounding_box()
+    assert box and footer
+    if box["y"] < 0 or box["y"] + box["height"] > footer["y"]:
+        page.mouse.move(page.viewport_size["width"] / 2, footer["y"] / 2)
+        page.mouse.wheel(0, box["y"] + box["height"] / 2 - footer["y"] / 2)
+        page.wait_for_function(
+            """el => {
+            const r = el.getBoundingClientRect();
+            const bottom = document.querySelector('[role=tablist]').getBoundingClientRect().top;
+            return r.top >= 0 && r.bottom <= bottom;
+        }""",
+            arg=handle,
+            timeout=5000,
+        )
+    control.click()
+
+
+def check_reliability(page, base_url, state_dir, enable_accessibility):
+    """Small repeatable real-input loop, without the full task/snapshot scenario."""
+    from playwright.sync_api import expect
+
+    from auth import create_demo_actor
+    from services import save_watch
+
+    run = import_snapshot(state_dir, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    save_watch(create_demo_actor(), "600001.SH", run, {}, 0, state_dir, "demo")
+    sockets = []
+
+    def connect(ws):
+        assert urlparse(ws.url).hostname == "127.0.0.1"
+        sockets.append((ws, ws.connect_to_server()))
+
+    page.route_web_socket("**/*", connect)
+    page.goto(f"{base_url}/")
+    enable_accessibility()
+    previous = ("", "")
+    for width in (360, 390, 430):
+        page.set_viewport_size({"width": width, "height": 844})
+        samples = []
+        for attempt in range(1, 11):
+            print(f"Reliability {width}px #{attempt}: open/input/save/reconnect/return", flush=True)
+            start = time.perf_counter()
+            page.get_by_role("button", name="查看详情", exact=True).first.click()
+            expect(page).to_have_url(re.compile(r"/company/600001.SH$"))
+            notes = page.get_by_role("button", name=re.compile("^(展开|收起)可选笔记"))
+            if notes.inner_text().startswith("展开"):
+                notes.click()
+            reason = page.get_by_role("textbox", name=re.compile("一句理由"))
+            next_check = page.get_by_role("textbox", name="下一步核查提示", exact=False)
+            reason_value, next_value = f"合成理由{width}-{attempt}", f"核查原文{width}-{attempt}"
+            for field, value, old_value in (
+                (reason, reason_value, previous[0]),
+                (next_check, next_value, previous[1]),
+            ):
+                click_settled(page, field)
+                expect(field).to_be_focused()
+                # Flutter populates the editor after focus; don't select its transient empty value.
+                expect(field).to_have_value(old_value)
+                page.keyboard.press("ControlOrMeta+A")
+                page.wait_for_function(
+                    "el => el.selectionStart === 0 && el.selectionEnd === el.value.length",
+                    arg=field.element_handle(),
+                )
+                page.keyboard.press("Backspace")
+                expect(field).to_have_value("")
+                page.keyboard.type(value)
+                expect(field).to_have_value(value)
+            save = page.get_by_role("button", name="保存笔记与状态", exact=True)
+            click_settled(page, save)
+            expect(page.get_by_text("保存成功", exact=False)).to_be_visible()
+            with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
+                assert conn.execute(
+                    "SELECT reason,next_check FROM watch_items WHERE code='600001.SH'"
+                ).fetchone() == (reason_value, next_value)
+                assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 0
+
+            count = len(sockets)
+            old_editor = reason.element_handle()
+            client, server = sockets[-1]
+            server.close(code=1012, reason="synthetic reconnect")
+            client.close(code=1012, reason="synthetic reconnect")
+            deadline = time.monotonic() + 15
+            while len(sockets) == count and time.monotonic() < deadline:
+                page.wait_for_timeout(50)  # Poll an observed connection, not a layout delay.
+            assert len(sockets) > count, "WebSocket did not reconnect"
+            page.wait_for_function("el => !el.isConnected", arg=old_editor)
+            expect(notes).to_be_visible()
+            if notes.inner_text().startswith("展开"):
+                click_settled(page, notes)
+            click_settled(page, reason)
+            expect(reason).to_have_value(reason_value)
+            click_settled(page, next_check)
+            expect(next_check).to_have_value(next_value)
+            page.get_by_role("tab", name="我的关注", exact=False).click()
+            expect(page).to_have_url(f"{base_url}/")
+            expect(
+                page.get_by_text(next_value, exact=False)
+                .or_(page.get_by_role("group", name=re.compile(re.escape(next_value))))
+                .first
+            ).to_be_visible()
+            previous = (reason_value, next_value)
+            samples.append(time.perf_counter() - start)
+        print(
+            f"Reliability {width}px: 10/10; full-loop seconds median={statistics.median(samples):.2f}, max={max(samples):.2f}",
+            flush=True,
+        )
+
+
+def main(*, reliability: bool = False) -> int:
     try:
         from playwright.sync_api import expect, sync_playwright
     except ImportError:
@@ -174,6 +302,12 @@ def main() -> int:
                 return False
 
             try:
+                if reliability:
+                    check_reliability(page, base_url, state_dir, enable_accessibility)
+                    print(
+                        "Reliability browser checks passed: 360/390/430px × 10; synthetic, not a real device."
+                    )
+                    return 0
                 # 1. Open home page
                 page.goto(f"{base_url}/", timeout=15000)
                 page.wait_for_load_state("domcontentloaded")
@@ -677,4 +811,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--reliability",
+        action="store_true",
+        help="Repeat the focused input/reconnect flow 10 times per width",
+    )
+    sys.exit(main(reliability=parser.parse_args().reliability))
