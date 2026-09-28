@@ -1123,8 +1123,19 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
             assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 0
         # A detached old add callback cannot write after navigation.
         stale_add = button("关注")
+        original_update = page.update
+
+        def late_scroll_during_render():
+            original_update()
+            if page.route == "/":
+                page.views[0].on_scroll(SimpleNamespace(pixels=2500))
+
+        page.update = late_scroll_during_render
         page.navigation_bar.selected_index = 0
         await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
+        assert page.scroll_offset == 0  # A departing long page must not steal Home's offset.
+        page.update = original_update
+        page.views[0].on_scroll(SimpleNamespace(pixels=0))
         await stale_add.on_click(None)
         # The new detail-page follow/toggle callbacks must also expire on navigation.
         await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
@@ -1141,7 +1152,8 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
     asyncio.run(check())
 
 
-def test_company_changed_ack_waits_for_real_comparison(tmp_path, monkeypatch):
+@pytest.mark.parametrize("damage_baseline", [False, True])
+def test_company_changed_ack_requires_displayed_comparison(tmp_path, monkeypatch, damage_baseline):
     from auth import create_demo_actor
     from services import mark_seen, save_watch
 
@@ -1153,7 +1165,13 @@ def test_company_changed_ack_waits_for_real_comparison(tmp_path, monkeypatch):
     actor = create_demo_actor()
     item = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
     mark_seen(actor, "600001.SH", first, item["revision"], tmp_path, "demo")
-    import_snapshot(tmp_path, fixture.with_name("peer_second_change.json"), "demo")
+    second = import_snapshot(tmp_path, fixture.with_name("peer_second_change.json"), "demo")
+    if damage_baseline:
+        with connect_workspace(tmp_path, "demo") as conn:
+            path = conn.execute(
+                "SELECT snapshot_path FROM screen_runs WHERE run_id=?", (first,)
+            ).fetchone()[0]
+        (tmp_path / path).unlink()
 
     async def check():
         page = AppMockPage()
@@ -1163,11 +1181,25 @@ def test_company_changed_ack_waits_for_real_comparison(tmp_path, monkeypatch):
         ack = next(
             c for c in controls if isinstance(c, ft.Button) and c.content == "标记本次变化已阅"
         )
-        assert ack.disabled
-        await ack.on_click(None)  # Server-side event guard even if a stale client fires it.
-        assert any("逐项对照尚未接入" in str(c.value) for c in controls if isinstance(c, ft.Text))
+        if damage_baseline:
+            assert ack.disabled
+            await ack.on_click(None)  # A stale client must not bypass the disabled control.
+            assert any("已阅基准异常" in str(c.value) for c in controls if isinstance(c, ft.Text))
+            with connect_workspace(tmp_path, "demo") as conn:
+                assert get_watch_item(conn, "600001.SH")["ack_run_id"] == first
+            await page.on_close(None)
+            return
+        assert not ack.disabled
+        texts = [str(c.value) for c in controls if isinstance(c, ft.Text)]
+        assert "上次已阅 → 当前资料" in texts
+        assert "【变化】PB（倍）：1.85 → 1.8" in texts
+        assert "【变化】2025年ROE（%）：15.8 → 16.5" in texts
         with connect_workspace(tmp_path, "demo") as conn:
             assert get_watch_item(conn, "600001.SH")["ack_run_id"] == first
+        await ack.on_click(None)
+        assert ack.disabled
+        with connect_workspace(tmp_path, "demo") as conn:
+            assert get_watch_item(conn, "600001.SH")["ack_run_id"] == second
         await page.on_close(None)
 
     asyncio.run(check())

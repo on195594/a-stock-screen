@@ -291,6 +291,15 @@ def main() -> int:
                     f"Expected reason '{test_reason}', got '{row['reason']}'"
                 )
                 assert row["revision"] >= 1, "Revision should be >= 1"
+                assert row["ack_run_id"] is None, "Saving notes must not acknowledge facts"
+                page.get_by_text("首次待阅：无已阅基准", exact=False).wait_for(state="visible")
+                page.get_by_role("button", name="标记本次变化已阅", exact=True).click()
+                page.get_by_text("已标记已阅", exact=False).wait_for(state="visible")
+                with sqlite3.connect(db_path) as conn:
+                    first_ack = conn.execute(
+                        "SELECT ack_run_id FROM watch_items WHERE code='600001.SH'"
+                    ).fetchone()[0]
+                    assert first_ack is not None
 
                 # U03: real browser back preserves the task's anchor/result; never submits again.
                 page.go_back()
@@ -367,13 +376,45 @@ def main() -> int:
                 page.locator("[aria-label='我的关注']").first.click()
                 page.get_by_role("button", name="查看详情", exact=True).first.click()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
+                # S2: the comparison is visible before confirmation; opening it is read-only.
+                for width in (360, 390, 430):
+                    page.set_viewport_size({"width": width, "height": 844})
+                    delta = page.get_by_text("【变化】PB（倍）：1.85 → 1.8", exact=True)
+                    delta.scroll_into_view_if_needed()
+                    expect(delta).to_be_visible()
+                    bounds = delta.bounding_box()
+                    assert (
+                        bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
+                    )
+                page.set_viewport_size({"width": 390, "height": 844})
+                expect(
+                    page.get_by_text("【变化】2025年ROE（%）：15.8 → 16.5", exact=True)
+                ).to_be_visible()
+                with sqlite3.connect(db_path) as conn:
+                    assert (
+                        conn.execute(
+                            "SELECT ack_run_id FROM watch_items WHERE code='600001.SH'"
+                        ).fetchone()[0]
+                        == first_ack
+                    )
                 open_notes()
+                page.get_by_role("button", name="标记本次变化已阅", exact=True).click()
+                page.get_by_text("已标记已阅", exact=False).wait_for(state="visible")
+                with sqlite3.connect(db_path) as conn:
+                    assert (
+                        conn.execute(
+                            "SELECT ack_run_id FROM watch_items WHERE code='600001.SH'"
+                        ).fetchone()[0]
+                        != first_ack
+                    )
                 removal_reason = page.locator("textarea[aria-label*='理由']").first
                 removal_reason.click()  # Flutter syncs the editing value when focused.
                 expect(removal_reason).to_have_value(test_reason)
                 removal_reason.press("End")
                 removal_reason.press_sequentially("（未保存）")
-                page.get_by_role("button", name="删除个人研究记录", exact=True).click()
+                delete_button = page.get_by_role("button", name="删除个人研究记录", exact=True)
+                delete_button.scroll_into_view_if_needed()
+                delete_button.click()
                 page.get_by_role("button", name="取消", exact=True).click()
                 removal_reason.click()
                 expect(removal_reason).to_have_value(test_reason + "（未保存）")
@@ -440,7 +481,7 @@ def main() -> int:
                 # Flet may attempt optional CDN resources; every external request was aborted.
                 print(f"External requests blocked (none allowed): {sorted(set(blocked_requests))}")
                 print(
-                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> partial/old board -> delete/cancel/re-add -> dismiss failure/reload."
+                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload."
                 )
                 return 0
             except Exception as exc:

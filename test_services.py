@@ -185,6 +185,158 @@ def test_fact_insights_use_only_qualified_samples_and_support_annual_aliases() -
     assert roe_trend({}) == "ROE趋势：资料有缺口，暂不判断"
 
 
+def test_company_comparison_uses_ack_not_intermediate_run(tmp_path: Path) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    saved = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    initial = get_company_context(actor, "600001.SH", tmp_path, "demo")["comparison"]
+    assert initial["can_ack"] and "首次待阅" in initial["summary"]
+    seen = mark_seen(actor, "600001.SH", first, saved["revision"], tmp_path, "demo")
+    import_snapshot(tmp_path, FIXTURES_DIR / "peer_second_change.json", "demo")
+    snap = json.loads((FIXTURES_DIR / "peer_second_change.json").read_text())
+    snap["screened_at"] = "2026-09-22T16:00:00+08:00"
+    snap["rows"][0]["pb"] = 1.7
+    snap["rows"][0]["annual_roes"][-1]["report_type"] = "1"
+    snap["rows"][0]["annual_roes"][-1]["update_flag"] = "1"
+    path = tmp_path / "third.json"
+    path.write_text(json.dumps(snap))
+    third = import_snapshot(tmp_path, path, "demo")
+    ctx = get_company_context(actor, "600001.SH", tmp_path, "demo")
+    comparison = ctx["comparison"]
+    assert ctx["ack_run_id"] == first and ctx["displayed_run_id"] == third
+    assert comparison["can_ack"]
+    fields = {item["label"]: item for item in comparison["items"]}
+    assert fields["PB（倍）"] == {
+        "label": "PB（倍）",
+        "before": 1.85,
+        "after": 1.7,
+        "changed": True,
+    }
+    assert fields["2025年ROE（%）"]["before"] == 15.8
+    assert fields["2025年ROE（%）"]["after"] == 16.5
+    assert fields["2025年公告日"]["changed"]
+    assert fields["2025年修订标记"]["changed"]
+    assert fields["2025年报告类型"]["changed"]
+    saved = save_watch(
+        actor, "600001.SH", third, {"reason": "合成笔记"}, seen["revision"], tmp_path, "demo"
+    )
+    assert saved["ack_run_id"] == first  # Notes and opening the comparison never acknowledge.
+    seen = mark_seen(actor, "600001.SH", third, saved["revision"], tmp_path, "demo")
+    assert seen["ack_run_id"] == third
+    assert (
+        get_company_context(actor, "600001.SH", tmp_path, "demo")["comparison"]["summary"]
+        == "本页所示资料已阅"
+    )
+
+
+@pytest.mark.parametrize("change", ["checked_only", "date_only", "scope", "years"])
+def test_company_comparison_distinguishes_changes(tmp_path: Path, change: str) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    initial = FIXTURES_DIR / "peer_complete_v1.json"
+    if change == "years":
+        baseline = json.loads(initial.read_text())
+        baseline["data_date"] = "2025-09-20"
+        baseline["screened_at"] = "2025-09-20T16:00:00+08:00"
+        for r in baseline["rows"]:
+            r["valuation_date"] = baseline["data_date"]
+            for annual in r["annual_roes"]:
+                annual["year"] -= 1
+                annual["ann_date"] = str(int(annual["ann_date"][:4]) - 1) + annual["ann_date"][4:]
+        initial = tmp_path / "baseline.json"
+        initial.write_text(json.dumps(baseline))
+    first = import_snapshot(tmp_path, initial, "demo")
+    saved = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    mark_seen(actor, "600001.SH", first, saved["revision"], tmp_path, "demo")
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    snap["screened_at"] = "2026-09-22T16:00:00+08:00"
+    row = snap["rows"][0]
+    row["financial_checked_at"] = snap["screened_at"]
+    row["annual_roes"].reverse()
+    if change == "date_only":
+        snap["data_date"] = "2026-09-21"
+    elif change == "scope":
+        snap["scope"]["selected_codes"].pop()
+        snap["scope"]["enumerated_codes"].pop()
+        snap["scope"]["enumerated_count"] = snap["scope"]["total_candidates"] = 3
+        snap["rows"].pop()
+        snap["results"] = screen.rank_peers(snap["rows"], snap["anchor"], ["600001"])
+    for r in snap["rows"]:
+        r["valuation_date"] = snap["data_date"]
+    path = tmp_path / "new.json"
+    path.write_text(json.dumps(snap))
+    latest = import_snapshot(tmp_path, path, "demo")
+    context = get_company_context(actor, "600001.SH", tmp_path, "demo")
+    assert context["displayed_run_id"] == latest
+    comparison = context["comparison"]
+    fields = {i["label"]: i for i in comparison["items"]}
+    if change == "checked_only":
+        assert "暂无未阅变化" in comparison["summary"]
+        assert not any(i["changed"] for i in comparison["items"])
+    elif change == "date_only":
+        assert "仅估值日期更新" in comparison["summary"]
+    elif change == "scope":
+        assert fields["本次范围成员"]["changed"]
+    else:
+        assert fields["2022年ROE（%）"]["after"] is None
+        assert fields["2025年ROE（%）"]["before"] is None
+        assert fields["2025年ROE（%）"]["after"] == 15.8
+
+
+@pytest.mark.parametrize("damage", ["missing", "hash", "unknown_rule"])
+def test_company_comparison_cannot_replace_damaged_ack_baseline(
+    tmp_path: Path, damage: str
+) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    saved = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    seen = mark_seen(actor, "600001.SH", first, saved["revision"], tmp_path, "demo")
+    second = import_snapshot(tmp_path, FIXTURES_DIR / "peer_second_change.json", "demo")
+    assert get_company_context(actor, "600001.SH", tmp_path, "demo")["comparison"]["can_ack"]
+    with connect_workspace(tmp_path, "demo") as conn:
+        path = tmp_path / get_run(conn, first)["snapshot_path"]
+        if damage == "missing":
+            path.unlink()
+        elif damage == "hash":
+            path.write_text("{}")
+        else:
+            conn.execute("UPDATE screen_runs SET rule_id='unknown' WHERE run_id=?", (first,))
+            conn.commit()
+    ctx = get_company_context(actor, "600001.SH", tmp_path, "demo")
+    assert not ctx["comparison"]["can_ack"]
+    assert "已阅基准异常" in ctx["comparison"]["summary"]
+    assert ctx["displayed_run_id"] == second
+    with pytest.raises(ServiceError, match="已阅基准异常"):
+        mark_seen(actor, "600001.SH", second, seen["revision"], tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert get_watch_item(conn, "600001.SH")["ack_run_id"] == first
+
+
+def test_mark_seen_revoked_during_comparison_rolls_back(tmp_path: Path) -> None:
+    import services
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    saved = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    seen = mark_seen(actor, "600001.SH", first, saved["revision"], tmp_path, "demo")
+    second = import_snapshot(tmp_path, FIXTURES_DIR / "peer_second_change.json", "demo")
+    original = services.mark_watch_ack
+
+    def revoke_after_write(*args, **kwargs):
+        original(*args, **kwargs)
+        actor.revoke()
+
+    with patch("services.mark_watch_ack", side_effect=revoke_after_write):
+        with pytest.raises(AuthError):
+            mark_seen(actor, "600001.SH", second, seen["revision"], tmp_path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        item = get_watch_item(conn, "600001.SH")
+        assert item["ack_run_id"] == first and item["revision"] == seen["revision"]
+
+
 def test_auth_boundaries() -> None:
     demo = create_demo_actor()
     assert demo.is_valid

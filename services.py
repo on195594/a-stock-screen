@@ -219,6 +219,105 @@ def peer_fact_insights(run: dict[str, Any], snap: dict[str, Any]) -> dict[str, d
     return insights
 
 
+def _company_comparison(
+    conn: sqlite3.Connection,
+    state_dir: Path,
+    code: str,
+    displayed_run_id: str | None,
+    ack_run_id: str | None,
+) -> dict[str, Any]:
+    """Compare the exact acknowledged and displayed snapshots, never an intermediate run."""
+
+    def facts(run_id: str) -> dict[str, Any]:
+        run = get_run(conn, run_id)
+        if not run or run["health"] not in ("complete", "partial"):
+            raise ServiceError("运行不可用于事实对照")
+        if run["kind"] == "peer" and run["rule_id"] != "peer-screen-v1":
+            raise ServiceError("未知同业规则")
+        snap = read_verified_snapshot(state_dir, run["snapshot_path"], run["snapshot_sha256"])
+        rows = [r for r in safe_rows(snap) if r.get("code") == code]
+        if (
+            len(rows) != 1
+            or not is_row_usable(rows[0])
+            or rows[0].get("facts_usable") is False
+            or rows[0].get("financial_status") == "failed"
+        ):
+            raise ServiceError("公司事实缺失、重复或不可用")
+        row = rows[0]
+        scope = snap.get("scope")
+        scope = scope if isinstance(scope, dict) else {}
+        members = (
+            scope.get("selected_codes")
+            if run["kind"] == "peer"
+            else watch_run_targets(conn, run_id)
+        )
+        if members is not None and (
+            not isinstance(members, (list, set)) or any(not isinstance(c, str) for c in members)
+        ):
+            raise ServiceError("范围成员异常")
+        fields: dict[str, Any] = {
+            "估值日": row["valuation_date"],
+            "PB（倍）": row["pb"],
+            "ROE三年均值（%）": row["roe_mean"],
+        }
+        for annual in _annual_facts(row):
+            year = annual["period_end"][:4]
+            fields[f"{year}年ROE（%）"] = annual["roe"]
+            fields[f"{year}年公告日"] = annual["ann_date"]
+            fields[f"{year}年报告类型"] = annual["report_type"]
+            fields[f"{year}年修订标记"] = annual["update_flag"]
+        fields.update(
+            {
+                "估值来源": row.get("valuation_source"),
+                "财务来源": row.get("financial_source"),
+                "规则": run.get("rule_id") or "固定关注资料（无同业排名）",
+                "运行类型": "同业扫描" if run["kind"] == "peer" else "固定关注资料",
+                "参照公司": run.get("anchor_code"),
+                "运行完整性": "完整" if run["health"] == "complete" else "部分完成",
+                "行业": scope.get("industry"),
+                "筛选排除项": tuple(sorted(row.get("exclusions") or [])),
+                "本次范围成员": tuple(sorted(members)) if members is not None else None,
+            }
+        )
+        return fields
+
+    blocked = {"can_ack": False, "items": []}
+    if not displayed_run_id:
+        return {**blocked, "summary": "暂无可用事实，不能确认已阅"}
+    try:
+        current = facts(displayed_run_id)
+    except ServiceError:
+        return {**blocked, "summary": "当前资料异常或规则未知，不能确认已阅"}
+    if ack_run_id:
+        try:
+            previous = facts(ack_run_id)
+        except ServiceError:
+            return {**blocked, "summary": "已阅基准异常或规则未知，无法对照；不自动改用其他基准"}
+    else:
+        previous = {}
+    items = [
+        {
+            "label": key,
+            "before": previous.get(key),
+            "after": current.get(key),
+            "changed": previous.get(key) != current.get(key),
+        }
+        for key in dict.fromkeys([*previous, *current])
+    ]
+    changed = [i["label"] for i in items if i["changed"]]
+    if not ack_run_id:
+        summary = "首次待阅：无已阅基准，核对当前完整事实后可确认"
+    elif ack_run_id == displayed_run_id:
+        summary = "本页所示资料已阅"
+    elif not changed:
+        summary = "本工具覆盖的字段暂无未阅变化（仅核查时间变化不算财务变化）"
+    elif changed == ["估值日"]:
+        summary = "仅估值日期更新，所列事实值未变"
+    else:
+        summary = "以下标有【变化】的字段与上次已阅资料不同"
+    return {"can_ack": True, "summary": summary, "items": items}
+
+
 def _watch_anchor(conn: sqlite3.Connection, item: dict[str, Any] | None) -> str | None:
     if not item:
         return None
@@ -621,6 +720,15 @@ def get_company_context(
             "peer_rank": last_peer_rank,
         }
 
+        context["comparison"] = _company_comparison(
+            conn, state_dir, code, context["displayed_run_id"], context["ack_run_id"]
+        )
+        if context["has_latest_attempt_gap"]:
+            context["comparison"]["can_ack"] = False
+            context["comparison"]["summary"] = (
+                "本次资料有缺口或日期异常；以下仅为旧可用事实对照，不可将旧资料标记为本次已阅"
+            )
+        check_actor(actor)
         if include_personal_notes and watch_item:
             context["reason"] = watch_item.get("reason", "")
             context["next_check"] = watch_item.get("next_check", "")
@@ -792,6 +900,14 @@ def mark_seen(
                     and item["ack_run_id"] != displayed_run_id
                 ):
                     raise ServiceError("记录已变化或已删除后重新加入，请刷新后重试")
+            item = get_watch_item(conn, code)
+            # Revalidate the same baseline at confirmation, including damage after page load.
+            if item and item["ack_run_id"] and item["ack_run_id"] != displayed_run_id:
+                comparison = _company_comparison(
+                    conn, state_dir, code, displayed_run_id, item["ack_run_id"]
+                )
+                if not comparison["can_ack"]:
+                    raise ServiceError(comparison["summary"])
             mark_watch_ack(
                 conn,
                 code=code,
@@ -801,6 +917,7 @@ def mark_seen(
             )
             updated = get_watch_item(conn, code)
             assert updated is not None
+            check_actor(actor)
             conn.commit()
             return dict(updated)
         except Exception:

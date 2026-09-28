@@ -157,6 +157,8 @@ def build_app():
             if poll is not None:
                 poll.cancel()
                 page_state["job_poll_task"] = None
+            # Freeze the destination offset before late scroll events from the old page arrive.
+            restore_offset = page_state["scroll_positions"].get(route, 0)
             page_state["generation"] += 1
             if route.startswith("/company/") and not page_state["route"].startswith("/company/"):
                 page_state["company_return"] = page_state["route"]
@@ -168,7 +170,7 @@ def build_app():
                 await page.push_route(route)
             await render_current_view()
             page.update()
-            await page.scroll_to(offset=page_state["scroll_positions"].get(route, 0), duration=0)
+            await page.scroll_to(offset=restore_offset, duration=0)
 
         async def on_route_change(e):
             if e.route != page_state["route"]:
@@ -1248,17 +1250,36 @@ def build_app():
                 page.update()
 
             page_state["save_current_form"] = on_save
-            comparison_pending = bool(
-                ctx.get("ack_run_id") and ctx["ack_run_id"] != ctx.get("displayed_run_id")
-            )
+            comparison = ctx.get("comparison") or {
+                "can_ack": False,
+                "summary": "暂无可用事实对照",
+                "items": [],
+            }
+            comparison_pending = not comparison["can_ack"]
+            comparison_summary = ft.Text(comparison["summary"], weight=ft.FontWeight.BOLD)
+
+            def comparison_value(value):
+                if value is None or value == "":
+                    return "未提供/不适用"
+                if isinstance(value, (tuple, list)):
+                    return "、".join(str(v) for v in value) or "无"
+                return str(value)
+
+            comparison_rows = [
+                ft.Text(
+                    f"{'【变化】' if item['changed'] and ctx.get('ack_run_id') else ''}"
+                    f"{item['label']}：{comparison_value(item['before'])} → "
+                    f"{comparison_value(item['after'])}",
+                    size=13,
+                )
+                for item in comparison["items"]
+            ]
 
             async def on_ack(e):
                 if gen != page_state["generation"] or not page_state["connected"]:
                     return
                 if comparison_pending:
-                    feedback_text.value = (
-                        "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存笔记。"
-                    )
+                    feedback_text.value = comparison["summary"]
                     page.update()
                     return
                 if not actor.is_valid:
@@ -1308,6 +1329,8 @@ def build_app():
                         page_state["current_company_revision"] = updated["revision"]
                         feedback_text.value = f"已标记已阅 (版本: {updated['revision']})"
                         feedback_text.color = ft.Colors.GREEN_700
+                        comparison_summary.value = "本页所示资料已阅；下次打开将以此作为对照基准。"
+                        ack_btn.disabled = True
                 except (ServiceError, WorkspaceError) as exc:
                     feedback_text.value = f"标记已阅失败: {exc}"
                     feedback_text.color = ft.Colors.RED_700
@@ -1336,11 +1359,15 @@ def build_app():
                 code=code,
             )
             delete_btn.visible = ctx["is_watched"]
+            already_acknowledged = bool(
+                ctx.get("ack_run_id") and ctx["ack_run_id"] == ctx.get("displayed_run_id")
+            )
             save_btn = ft.Button("保存笔记与状态", on_click=on_save, disabled=conflict_detected)
             ack_btn = ft.Button(
-                "标记本次变化已阅",
+                "已标记本次已阅" if already_acknowledged else "标记本次变化已阅",
                 on_click=on_ack,
-                disabled=comparison_pending
+                disabled=already_acknowledged
+                or comparison_pending
                 or conflict_detected
                 or ctx.get("has_latest_attempt_gap", False),
             )
@@ -1411,7 +1438,7 @@ def build_app():
                     *(
                         [
                             ft.Text(
-                                "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存笔记。",
+                                comparison["summary"],
                                 color=ft.Colors.AMBER_900,
                             )
                         ]
@@ -1534,6 +1561,11 @@ def build_app():
                                     ft.Text(FACT_LIMITS, size=13),
                                     follow_btn,
                                     follow_feedback,
+                                    ft.Text(
+                                        "上次已阅 → 当前资料", size=15, weight=ft.FontWeight.BOLD
+                                    ),
+                                    comparison_summary,
+                                    *comparison_rows,
                                     ft.Text(
                                         f"核查状态: {usable.get('financial_status', '无')} ({usable.get('financial_checked_at', '')})",
                                         size=12,
