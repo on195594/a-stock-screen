@@ -43,6 +43,10 @@ TRACKER_ROOT = Path(os.environ["TRACKER_ROOT"]) if os.getenv("TRACKER_ROOT") els
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8550")
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8550"))
+FACT_LIMITS = (
+    "尚未核查：资产质量与减值、负债与杠杆、现金流、一次性损益和审计意见。"
+    "低PB或高历史ROE不能回答是否值得买入。"
+)
 
 os.environ.setdefault("FLET_SESSION_TIMEOUT", "3600")
 os.environ.setdefault("FLET_OAUTH_STATE_TIMEOUT", "600")
@@ -407,10 +411,12 @@ def build_app():
                                         if it["has_change"]
                                         else ft.Colors.GREY_700,
                                     ),
+                                    ft.Text(it.get("fact_summary", "暂无可用事实"), size=14),
+                                    ft.Text(it.get("roe_trend", ""), size=13),
                                     ft.Row(
                                         controls=[
                                             ft.Text(
-                                                f"数据日：{it.get('valuation_date', '暂无')} | 理由：{it['reason'] or '暂无'}",
+                                                f"数据日：{it.get('valuation_date', '暂无')}",
                                                 size=13,
                                                 color=ft.Colors.BLACK_87,
                                                 expand=True,
@@ -429,7 +435,7 @@ def build_app():
             if not items_controls:
                 items_controls.append(
                     ft.Text(
-                        "暂无关注标的，可在同业发现中选择标的加入观察", color=ft.Colors.GREY_700
+                        "暂无关注标的，去同业发现一键关注，无需填写笔记", color=ft.Colors.GREY_700
                     )
                 )
 
@@ -456,7 +462,7 @@ def build_app():
                             controls=[
                                 ft.Column(
                                     [
-                                        ft.Text("我的研究", size=18, weight=ft.FontWeight.BOLD),
+                                        ft.Text("我的关注", size=18, weight=ft.FontWeight.BOLD),
                                         ft.Text(
                                             f"估值基准日：{data['valuation_date']} | 需要复看：{data['needs_review_count']} 家",
                                             size=13,
@@ -637,7 +643,7 @@ def build_app():
                     status, "未加入"
                 )
                 feedback = ft.Text("", size=13)
-                add_button = ft.Button("加入观察", disabled=not row.get("code"))
+                add_button = ft.Button("关注", disabled=not row.get("code"))
 
                 async def open_comp(e):
                     if gen == page_state["generation"] and actor.is_valid:
@@ -668,10 +674,10 @@ def build_app():
                             and actor.is_valid
                             and page_state["connected"]
                         ):
-                            add_button.content = "查看我的研究"
+                            add_button.content = "查看关注"
                             add_button.disabled = False
                             add_button.on_click = open_comp
-                            feedback.value = "已加入观察；未自动标记已阅。已有记录不会被覆盖。"
+                            feedback.value = "已关注，无需填写笔记；未自动已阅，已有记录不覆盖。"
                             page.update()
                     except (ServiceError, WorkspaceError, AuthError):
                         if gen == page_state["generation"] and actor.is_valid:
@@ -681,6 +687,7 @@ def build_app():
 
                 add_button.on_click = add_observation
                 annual = row.get("annual_roes") or []
+                insights = row.get("fact_insights") or {}
                 reasons = row.get("exclusions") or row.get("eligibility_reasons") or []
                 return ft.Container(
                     padding=12,
@@ -719,6 +726,8 @@ def build_app():
                                 for a in annual
                             ],
                             *([ft.Text("逐年ROE缺失，不补零")] if not annual else []),
+                            ft.Text(insights.get("pb_comparison", "PB中位数暂不比较：缺少事实")),
+                            ft.Text(insights.get("roe_trend", "ROE趋势：资料有缺口，暂不判断")),
                             *(
                                 [
                                     ft.Text(
@@ -731,9 +740,7 @@ def build_app():
                             ),
                             ft.Row(
                                 [
-                                    ft.Button(
-                                        "查看我的研究" if status else "查看", on_click=open_comp
-                                    ),
+                                    ft.Button("查看关注" if status else "查看", on_click=open_comp),
                                     *([] if status else [add_button]),
                                 ],
                                 wrap=True,
@@ -861,6 +868,13 @@ def build_app():
                         size=13,
                     )
                 )
+                rows_controls.append(
+                    ft.Text(
+                        f"比较范围：{disc_data.get('scope', {}).get('industry') or '行业未记录'}；"
+                        "沪深主板非金融，按市值最多50家，偏向大市值，非全行业；业务可比性未核查。",
+                        size=12,
+                    )
+                )
                 rows = {r.get("code") or r.get("ts_code"): r for r in disc_data["rows"]}
                 ranking = disc_data["results"]["ranking"]
                 date_sets = {r.get("valuation_date") for r in rows.values()}
@@ -914,12 +928,14 @@ def build_app():
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     ),
                     anchor_field,
+                    ft.Text(FACT_LIMITS, size=13),
                     ft.Text(
                         "仅支持原关注参照；金融或行业未知不适用。",
                         size=12,
                     ),
                     ft.Text(
-                        "研究次序不是买入建议；请比较实际指标并核查业务、资产与盈利质量。", size=13
+                        "研究次序不是买入分数。PB是市价与每股净资产之比；ROE是历史净资产收益率，三年均值不是每年都盈利。",
+                        size=13,
                     ),
                     *(
                         [ft.Text("正在查看指定任务的结果/诊断，并非后来最新资料。", size=12)]
@@ -1096,7 +1112,7 @@ def build_app():
             note_url_val = draft.get("note_url") if "note_url" in draft else (ctx["note_url"] or "")
 
             status_dd = ft.Dropdown(
-                label="观察状态",
+                label="关注状态（可选）",
                 options=[
                     ft.dropdown.Option("research", "研究中"),
                     ft.dropdown.Option("observe", "观察"),
@@ -1216,6 +1232,8 @@ def build_app():
                     ctx["updated_at"] = updated["updated_at"]
                     page_state["current_company_updated_at"] = updated["updated_at"]
                     delete_btn.visible = True
+                    follow_btn.content = "已关注"
+                    follow_btn.disabled = True
                     page_state["current_company_revision"] = updated["revision"]
                     page_state["current_form_baseline"] = get_current_form()
                     page_state.setdefault("drafts", {}).pop(code, None)
@@ -1239,7 +1257,7 @@ def build_app():
                     return
                 if comparison_pending:
                     feedback_text.value = (
-                        "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存判断。"
+                        "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存笔记。"
                     )
                     page.update()
                     return
@@ -1318,7 +1336,7 @@ def build_app():
                 code=code,
             )
             delete_btn.visible = ctx["is_watched"]
-            save_btn = ft.Button("保存判断", on_click=on_save, disabled=conflict_detected)
+            save_btn = ft.Button("保存笔记与状态", on_click=on_save, disabled=conflict_detected)
             ack_btn = ft.Button(
                 "标记本次变化已阅",
                 on_click=on_ack,
@@ -1327,8 +1345,27 @@ def build_app():
                 or ctx.get("has_latest_attempt_gap", False),
             )
 
+            notes_key = (page_state["route"], "optional_notes")
+            notes_expanded = bool(draft) or page_state["expanded_sections"].get(notes_key, False)
+
+            async def toggle_notes(e):
+                nonlocal notes_expanded
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
+                notes_expanded = not notes_expanded
+                page_state["expanded_sections"][notes_key] = notes_expanded
+                for control in form_controls[1:]:
+                    control.visible = notes_expanded and (
+                        control is not delete_btn or ctx["is_watched"]
+                    )
+                page.update()
+
             form_controls: list[ft.Control] = [
-                ft.Text("个人研究记录", size=15, weight=ft.FontWeight.BOLD),
+                ft.Button("可选笔记、状态与已阅", on_click=toggle_notes),
             ]
             if conflict_detected:
                 conflict_banner = ft.Container(
@@ -1367,13 +1404,14 @@ def build_app():
                             ack_btn,
                         ],
                         spacing=8,
+                        wrap=True,
                     ),
                     feedback_text,
                     delete_btn,
                     *(
                         [
                             ft.Text(
-                                "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存判断。",
+                                "已阅→当前逐项对照尚未接入，暂不能确认这次变化；仍可保存笔记。",
                                 color=ft.Colors.AMBER_900,
                             )
                         ]
@@ -1383,6 +1421,54 @@ def build_app():
                 ]
             )
 
+            for control in form_controls[1:]:
+                control.visible = notes_expanded and (
+                    control is not delete_btn or ctx["is_watched"]
+                )
+
+            follow_feedback = ft.Text("关注不要求写笔记，也不自动标记已阅。", size=12)
+            follow_btn = ft.Button(
+                "已关注" if ctx["is_watched"] else "关注", disabled=ctx["is_watched"]
+            )
+
+            async def follow(e):
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
+                follow_btn.disabled = True
+                page.update()
+                try:
+                    await asyncio.to_thread(
+                        save_watch,
+                        actor,
+                        code,
+                        ctx.get("displayed_run_id") or "run_initial",
+                        {"status": "observe"},
+                        0,
+                        STATE_DIR,
+                        APP_MODE,
+                    )
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        await navigate(page_state["route"])
+                except (ServiceError, WorkspaceError, AuthError):
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        follow_feedback.value = "关注未确认，请重查或重试；重复关注不会覆盖原记录。"
+                        follow_btn.disabled = False
+                        page.update()
+
+            follow_btn.on_click = follow
+            insights = ctx.get("fact_insights") or {}
             return ft.Column(
                 controls=[
                     ft.Row(
@@ -1419,6 +1505,7 @@ def build_app():
                         else []
                     ),
                     ft.Card(
+                        semantic_container=False,
                         content=ft.Container(
                             padding=12,
                             content=ft.Column(
@@ -1433,6 +1520,21 @@ def build_app():
                                     ),
                                     *roe_rows,
                                     ft.Text(
+                                        insights.get(
+                                            "pb_comparison", "PB中位数暂不比较：暂无可用事实"
+                                        )
+                                    ),
+                                    ft.Text(
+                                        insights.get("roe_trend", "ROE趋势：资料有缺口，暂不判断")
+                                    ),
+                                    ft.Text(
+                                        "统计范围：本次沪深主板非金融、TuShare同行业合格样本，最多50家，偏向大市值；行业标签不证明业务可比。",
+                                        size=12,
+                                    ),
+                                    ft.Text(FACT_LIMITS, size=13),
+                                    follow_btn,
+                                    follow_feedback,
+                                    ft.Text(
                                         f"核查状态: {usable.get('financial_status', '无')} ({usable.get('financial_checked_at', '')})",
                                         size=12,
                                         color=ft.Colors.GREY_700,
@@ -1440,7 +1542,7 @@ def build_app():
                                 ],
                                 spacing=4,
                             ),
-                        )
+                        ),
                     ),
                     ft.Card(
                         semantic_container=False,
@@ -1522,7 +1624,7 @@ def build_app():
 
         nav_bar = ft.NavigationBar(
             destinations=[
-                ft.NavigationBarDestination(icon=ft.Icons.LIST, label="我的研究"),
+                ft.NavigationBarDestination(icon=ft.Icons.LIST, label="我的关注"),
                 ft.NavigationBarDestination(icon=ft.Icons.SEARCH, label="同业发现"),
             ],
             selected_index=0,

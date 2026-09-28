@@ -10,6 +10,7 @@ import urllib.parse
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,7 @@ from screen import (
     ScreenError,
     annual_entries,
     candidate_review_sections,
+    fmt_number,
     normalize_flag,
     read_watchlist,
 )
@@ -131,6 +133,92 @@ def _annual_facts(row: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(facts, key=lambda item: item["period_end"])
 
 
+def roe_trend(row: dict[str, Any]) -> str:
+    """Describe validated annual facts, not investment quality or future returns."""
+    if (
+        not is_row_usable(row)
+        or row.get("facts_usable") is False
+        or row.get("financial_status") == "failed"
+    ):
+        return "ROE趋势：资料有缺口，暂不判断"
+    annual = _annual_facts(row)
+    values = [a["roe"] for a in annual]
+    if values[0] < values[1] < values[2]:
+        trend = "连续上升"
+    elif values[0] > values[1] > values[2]:
+        trend = "连续下降"
+    elif values[0] == values[1] == values[2]:
+        trend = "三年相同"
+    else:
+        trend = "非单调变化"
+    warning = "；最新年度ROE为负，均值不能掩盖这一点" if values[-1] < 0 else ""
+    return (
+        f"ROE趋势（{annual[0]['period_end'][:4]}—{annual[-1]['period_end'][:4]}）：{trend}{warning}"
+    )
+
+
+def peer_fact_insights(run: dict[str, Any], snap: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Presentation only: one complete, same-date/year cohort; never alter ranks."""
+    rows = [r for r in safe_rows(snap) if isinstance(r.get("code"), str)]
+    ranks = safe_ranking(snap)
+    codes = {r["code"] for r in ranks if isinstance(r.get("code"), str)}
+    cohort = [r for r in rows if r.get("code") in codes]
+    reason = "不是完整的当前规则同业榜"
+    comparable = (
+        run.get("kind") == "peer"
+        and run.get("health") == "complete"
+        and run.get("rule_id") == "peer-screen-v1"
+        and isinstance(snap, dict)
+        and isinstance(snap.get("results"), dict)
+        and snap["results"].get("discovery_complete") is True
+    )
+    if comparable:
+        if len(codes) < 2:
+            reason = "合格样本不足2家"
+            comparable = False
+        elif (
+            len(codes) != len(ranks)
+            or len(cohort) != len(codes)
+            or {r.get("code") for r in cohort} != codes
+            or any(
+                not is_row_usable(r)
+                or r["pb"] <= 0
+                or r["roe_mean"] <= 0
+                or r.get("exclusions")
+                or r.get("facts_usable") is False
+                or r.get("financial_status") == "failed"
+                for r in cohort
+            )
+        ):
+            reason = "合格样本有缺失或异常"
+            comparable = False
+        elif (
+            any(r["valuation_date"] != run.get("valuation_date") for r in cohort)
+            or len({tuple(a["period_end"] for a in _annual_facts(r)) for r in cohort}) != 1
+        ):
+            reason = "估值日或财务年度不一致"
+            comparable = False
+    mid = median(float(r["pb"]) for r in cohort) if comparable else None
+    insights = {}
+    for row in rows:
+        comparison = f"PB中位数暂不比较：{reason}"
+        if mid is not None:
+            if row.get("code") not in codes:
+                comparison = "未进入本次合格样本，不参与PB中位数比较"
+            else:
+                pb = float(row["pb"])
+                relation = "低于" if pb < mid else "高于" if pb > mid else "等于"
+                comparison = (
+                    f"PB{relation}本次同口径合格样本中位数 {fmt_number(mid)} 倍"
+                    f"（{len(cohort)}家，含本公司）；不等于低估或高估"
+                )
+        insights[row.get("code", "")] = {
+            "pb_comparison": comparison,
+            "roe_trend": roe_trend(row),
+        }
+    return insights
+
+
 def _watch_anchor(conn: sqlite3.Connection, item: dict[str, Any] | None) -> str | None:
     if not item:
         return None
@@ -213,6 +301,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
             latest_corrupt_index = None
             latest_index = None
             usable_run = None
+            usable_row = None
             for index, r in enumerate(runs):
                 if r.get("health") == "unverified":
                     continue
@@ -239,6 +328,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                         usable_run["valuation_date"] or ""
                     ):
                         usable_run = r
+                        usable_row = row
 
             ack_run = get_run(conn, ack_run_id) if ack_run_id else None
             latest_date = latest_run["valuation_date"] if latest_run else None
@@ -336,6 +426,13 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     "change_summary": change_summary,
                     "revision": it["revision"],
                     "valuation_date": item_date,
+                    "fact_summary": (
+                        f"PB {fmt_number(usable_row.get('pb'))} 倍 · "
+                        f"ROE三年均值 {fmt_number(usable_row.get('roe_mean'))}%"
+                        if usable_row
+                        else "暂无可用事实"
+                    ),
+                    "roe_trend": roe_trend(usable_row or {}),
                 }
             )
 
@@ -371,6 +468,7 @@ def get_company_context(
 
         usable_fact_run = None
         usable_fact_row = None
+        fact_insights: dict[str, str] = {}
         latest_attempt_run = None
         latest_attempt_row = None
         latest_attempt_error = None
@@ -425,6 +523,7 @@ def get_company_context(
             ):
                 usable_fact_run = r
                 usable_fact_row = row
+                fact_insights = peer_fact_insights(r, snap).get(code, {})
 
         ack_run = (
             get_run(conn, watch_item["ack_run_id"])
@@ -495,6 +594,7 @@ def get_company_context(
             "ack_run_id": watch_item.get("ack_run_id") if watch_item else None,
             "displayed_run_id": usable_fact_run.get("run_id") if usable_fact_run else None,
             "usable_fact": usable_fact_data,
+            "fact_insights": fact_insights,
             "usable_valuation_date": usable_fact_run.get("valuation_date")
             if usable_fact_run
             else None,
@@ -770,10 +870,12 @@ def job_status_label(job: dict[str, Any]) -> str:
 def _peer_result(run: dict[str, Any], snap: dict[str, Any]) -> dict[str, Any]:
     """Presentation facts only; never recompute eligibility or ranking."""
     results = dict(snap["results"]) if isinstance(snap.get("results"), dict) else {}
+    insights = peer_fact_insights(run, snap)
     # Report formatter uses period/roe_waa; historical synthetic fixtures used year/roe.
     rows = [
         {
             **row,
+            "fact_insights": insights.get(row.get("code", ""), {}),
             "annual_roes": [
                 {
                     **a,

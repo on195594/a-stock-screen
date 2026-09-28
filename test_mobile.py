@@ -206,27 +206,51 @@ def main() -> int:
                         bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
                     )
                     assert page.get_by_text("2025年 ROE 14.00%", exact=True).count() == 1
+                    comparison = page.get_by_text(
+                        "PB低于本次同口径合格样本中位数", exact=False
+                    ).first
+                    comparison.scroll_into_view_if_needed()
+                    assert comparison.is_visible()
+                    bounds = comparison.bounding_box()
+                    assert (
+                        bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
+                    )
+                    assert (
+                        page.get_by_text("ROE趋势（2023—2025）：连续上升", exact=True).count() >= 1
+                    )
+                    assert page.get_by_text("尚未核查：", exact=False).count() >= 1
                 page.set_viewport_size({"width": 390, "height": 844})
                 page.get_by_role("button", name="展开依据、来源与排除原因", exact=True).click()
                 page.get_by_text(
                     "沪深主板、TuShare粗行业", exact=False
                 ).scroll_into_view_if_needed()
-                assert page.get_by_text("最多50家", exact=False).is_visible()
+                assert page.get_by_text(
+                    "沪深主板、TuShare粗行业、按市值最多50家", exact=False
+                ).is_visible()
                 assert page.get_by_text("与参照比较：", exact=False).count() >= 1
                 page.get_by_role("button", name="展开依据、来源与排除原因", exact=True).click()
 
                 # Add anchor directly; no automatic ack.
-                page.get_by_role("button", name="加入观察", exact=True).nth(1).click()
-                page.wait_for_selector("text=已加入观察", timeout=10000)
+                page.get_by_role("button", name="关注", exact=True).nth(1).click()
+                page.wait_for_selector("text=已关注，无需填写笔记", timeout=10000)
                 with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
                     assert conn.execute(
                         "SELECT ack_run_id FROM watch_items WHERE code='600001.SH'"
                     ).fetchone() == (None,)
-                page.get_by_role("button", name="查看我的研究", exact=True).first.click()
+                page.get_by_role("button", name="查看关注", exact=True).first.click()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
                 time.sleep(1)
 
-                # 4. Fill in personal research reason
+                def open_notes():
+                    reason = page.locator("textarea[aria-label*='理由']").first
+                    if not reason.is_visible():
+                        page.get_by_role("button", name="可选笔记、状态与已阅", exact=True).click()
+                    reason.wait_for(state="visible", timeout=10000)
+
+                # Following is complete without a form; old notes are optional and preserved.
+                expect(page.locator("textarea[aria-label*='理由']").first).not_to_be_visible()
+                open_notes()
+                # 4. Fill in optional personal notes
                 test_reason = "移动端自动化测试理由"
                 reason_input = page.locator("textarea[aria-label*='理由']").first
                 reason_input.click()
@@ -245,7 +269,7 @@ def main() -> int:
                 assert reason_input.is_visible(), "Cancel did not keep the editor visible"
 
                 # 5. Verify Save button accessibility and interactive state via semantic locator
-                save_btn = page.locator("flt-semantics[role='button']:has-text('保存判断')").first
+                save_btn = page.get_by_role("button", name="保存笔记与状态", exact=True)
                 save_btn.scroll_into_view_if_needed()
                 assert save_btn.is_visible(), "Save button is not visible in accessibility tree"
                 assert save_btn.is_enabled(), "Save button is not enabled"
@@ -272,15 +296,15 @@ def main() -> int:
                 page.go_back()
                 page.wait_for_selector("text=当前完整榜", timeout=10000)
                 assert page.url == result_url
-                page.get_by_role("button", name="查看我的研究", exact=True).first.click()
+                page.get_by_role("button", name="查看关注", exact=True).first.click()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
 
                 # 7. Navigate back to Home and verify persisted item on home list
-                home_nav = page.locator("[aria-label='我的研究']").first
+                home_nav = page.locator("[aria-label='我的关注']").first
                 if home_nav.is_visible():
                     home_nav.click()
                 else:
-                    assert click_semantics_button("我的研究"), "Could not click 我的研究 tab"
+                    assert click_semantics_button("我的关注"), "Could not click 我的关注 tab"
                 page.wait_for_function(
                     '() => document.body.innerText.includes("关注清单 (1)")', timeout=10000
                 )
@@ -308,6 +332,7 @@ def main() -> int:
                     assert click_semantics_button("查看详情"), "Could not click 查看详情 button"
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
                 time.sleep(1)
+                open_notes()
                 detail_reason = page.locator("textarea[aria-label*='理由']").first
                 detail_reason.click()
                 time.sleep(0.5)
@@ -339,8 +364,10 @@ def main() -> int:
                 with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
                     assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
                 # Real confirmation/cancellation and visible deletion feedback, not DB fallbacks.
-                page.locator("[aria-label='我的研究']").first.click()
+                page.locator("[aria-label='我的关注']").first.click()
                 page.get_by_role("button", name="查看详情", exact=True).first.click()
+                page.wait_for_selector("text=公司筛选事实", timeout=10000)
+                open_notes()
                 removal_reason = page.locator("textarea[aria-label*='理由']").first
                 removal_reason.click()  # Flutter syncs the editing value when focused.
                 expect(removal_reason).to_have_value(test_reason)
@@ -364,11 +391,15 @@ def main() -> int:
                 page.wait_for_load_state("domcontentloaded")
                 enable_accessibility()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
+                # This session remembers the previously opened section; following still needs no form.
+                page.get_by_role("button", name="可选笔记、状态与已阅", exact=True).click()
+                expect(page.locator("textarea[aria-label*='理由']").first).not_to_be_visible()
+                page.get_by_role("button", name="关注", exact=True).click()
+                expect(page.get_by_role("button", name="已关注", exact=True)).to_be_disabled()
+                open_notes()
                 fresh_reason = page.locator("textarea[aria-label*='理由']").first
                 fresh_reason.click()
                 expect(fresh_reason).to_have_value("")
-                page.get_by_role("button", name="保存判断", exact=True).click()
-                page.get_by_text("保存成功", exact=False).wait_for(state="visible")
                 with sqlite3.connect(state_dir / "workspace.sqlite3") as conn:
                     assert conn.execute(
                         "SELECT reason,ack_run_id FROM watch_items WHERE code='600001.SH'"
@@ -383,7 +414,7 @@ def main() -> int:
                             "SELECT payload_json FROM update_jobs WHERE job_id='synthetic-failure'"
                         ).fetchone()[0]
                     )["target_date"]
-                page.locator("[aria-label='我的研究']").first.click()
+                page.locator("[aria-label='我的关注']").first.click()
                 failed_label = f"600001.SH · {target_date} · 失败"
                 page.get_by_role("button", name=failed_label, exact=True).click()
                 page.get_by_role("button", name="清理失败任务", exact=True).click()

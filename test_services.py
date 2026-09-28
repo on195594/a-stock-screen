@@ -21,8 +21,10 @@ from services import (
     get_update_job,
     list_update_jobs,
     mark_seen,
+    peer_fact_insights,
     read_verified_snapshot,
     request_peer_update,
+    roe_trend,
     save_watch,
 )
 from workspace import (
@@ -41,6 +43,146 @@ FIXTURES_DIR = Path(__file__).parent / "tests" / "fixtures"
 def present(value: dict | None) -> dict:
     assert value is not None
     return value
+
+
+def test_fact_insights_keep_ranking_and_reveal_negative_latest_roe(tmp_path: Path) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    run_id = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        run = get_run(conn, run_id)
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    original = json.dumps(snap, sort_keys=True)
+    insights = peer_fact_insights(run, snap)
+    assert "高于" in insights["600001.SH"]["pb_comparison"]
+    assert "中位数 1.68 倍（4家，含本公司）" in insights["600001.SH"]["pb_comparison"]
+    assert "连续上升" in insights["600001.SH"]["roe_trend"]
+    actor = create_demo_actor()
+    assert (
+        get_company_context(actor, "600001.SH", tmp_path, "demo")["fact_insights"]
+        == insights["600001.SH"]
+    )
+    board = get_peer_discover(actor, "600001.SH", tmp_path, "demo")
+    assert board["rows"][0]["fact_insights"] == insights["600001.SH"]
+    assert json.dumps(snap, sort_keys=True) == original
+
+    # Codex's counterexample: cheap PB and a positive mean can hide a negative latest ROE.
+    snap["rows"] = snap["rows"][:2]
+    for row, pb, values in zip(snap["rows"], (0.6, 1.2), ([30, 20, -5], [8, 8, 8])):
+        row.update(pb=pb, roe_mean=sum(values) / 3)
+        for annual, value in zip(row["annual_roes"], values):
+            annual["roe"] = value
+        row["annual_roes"].reverse()  # Trend must use years, not JSON order.
+    snap["results"] = screen.rank_peers(snap["rows"], snap["anchor"], [])
+    original = json.dumps(snap, sort_keys=True)
+    insights = peer_fact_insights(run, snap)
+    assert snap["results"]["top"][0] == "600001.SH"
+    assert "低于" in insights["600001.SH"]["pb_comparison"]
+    assert "连续下降；最新年度ROE为负" in insights["600001.SH"]["roe_trend"]
+    assert "三年相同" in insights["600002.SH"]["roe_trend"]
+    assert json.dumps(snap, sort_keys=True) == original
+
+    # Equal composite ranks stay equal; the presenter invents no score or tie-break.
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    snap["rows"] = snap["rows"][:3]
+    for row, pb, roe in zip(snap["rows"], (3, 2, 1), (15, 10, 5)):
+        row.update(pb=pb, roe_mean=roe)
+        for annual in row["annual_roes"]:
+            annual["roe"] = roe
+    snap["results"] = screen.rank_peers(snap["rows"], snap["anchor"], [])
+    original = json.dumps(snap, sort_keys=True)
+    assert {r["research_order"] for r in snap["results"]["ranking"]} == {2.0}
+    insights = peer_fact_insights(run, snap)
+    assert "等于" in insights["600002.SH"]["pb_comparison"]
+    assert json.dumps(snap, sort_keys=True) == original
+
+
+@pytest.mark.parametrize(
+    "gap, expected",
+    [
+        ("partial", "不是完整"),
+        ("watch", "不是完整"),
+        ("unknown_rule", "不是完整"),
+        ("zero", "不足2家"),
+        ("single", "不足2家"),
+        ("missing", "缺失或异常"),
+        ("duplicate", "缺失或异常"),
+        ("invalid", "缺失或异常"),
+        ("nonfinite_pb", "缺失或异常"),
+        ("nonfinite_roe", "缺失或异常"),
+        ("excluded", "缺失或异常"),
+        ("duplicate_rank", "缺失或异常"),
+        ("date", "估值日或财务年度不一致"),
+        ("year", "估值日或财务年度不一致"),
+    ],
+)
+def test_fact_insights_refuse_incomparable_samples(gap: str, expected: str) -> None:
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    run = {
+        "kind": "peer",
+        "health": "complete",
+        "rule_id": "peer-screen-v1",
+        "valuation_date": "2026-09-20",
+    }
+    if gap == "partial":
+        run["health"] = "partial"
+    elif gap == "watch":
+        run["kind"] = "watch"
+    elif gap == "unknown_rule":
+        run["rule_id"] = "other"
+    elif gap in ("zero", "single"):
+        snap["results"]["ranking"] = snap["results"]["ranking"][: 0 if gap == "zero" else 1]
+    elif gap == "missing":
+        snap["rows"].pop()
+    elif gap == "duplicate":
+        snap["rows"].append(snap["rows"][0])
+    elif gap == "invalid":
+        snap["rows"][-1]["pb"] = None
+    elif gap == "nonfinite_pb":
+        snap["rows"][-1]["pb"] = float("inf")
+    elif gap == "nonfinite_roe":
+        snap["rows"][-1]["annual_roes"][0]["roe"] = float("nan")
+    elif gap == "excluded":
+        snap["rows"][-1]["exclusions"] = ["财务口径不符合"]
+    elif gap == "duplicate_rank":
+        snap["results"]["ranking"].append(snap["results"]["ranking"][0])
+    elif gap == "date":
+        snap["rows"][-1]["valuation_date"] = "2026-09-19"
+    elif gap == "year":
+        for annual in snap["rows"][-1]["annual_roes"]:
+            annual["year"] -= 1
+    insights = peer_fact_insights(run, snap)
+    assert expected in insights["600001.SH"]["pb_comparison"]
+    assert all("家，含本公司" not in i["pb_comparison"] for i in insights.values())
+
+
+def test_fact_insights_use_only_qualified_samples_and_support_annual_aliases() -> None:
+    snap = json.loads((FIXTURES_DIR / "peer_complete_v1.json").read_text())
+    run = {
+        "kind": "peer",
+        "health": "complete",
+        "rule_id": "peer-screen-v1",
+        "valuation_date": "2026-09-20",
+    }
+    # A usable but excluded row is not silently admitted into the cohort.
+    excluded = snap["rows"][-1]
+    excluded.update(pb=100, exclusions=["排除"])
+    snap["results"]["ranking"] = [
+        r for r in snap["results"]["ranking"] if r["code"] != excluded["code"]
+    ]
+    for row in snap["rows"]:
+        for annual in row["annual_roes"]:
+            annual["period"] = f"{annual.pop('year')}1231"
+            annual["roe_waa"] = annual.pop("roe")
+    insights = peer_fact_insights(run, snap)
+    assert "中位数 1.50 倍（3家，含本公司）" in insights["600001.SH"]["pb_comparison"]
+    assert "未进入本次合格样本" in insights[excluded["code"]]["pb_comparison"]
+    assert "2023—2025" in insights["600001.SH"]["roe_trend"]
+    row = snap["rows"][0]
+    row["annual_roes"][1]["roe_waa"] = 0
+    assert "非单调变化" in roe_trend(row)
+    row["annual_roes"][-1]["roe_waa"] = float("inf")
+    assert roe_trend(row) == "ROE趋势：资料有缺口，暂不判断"
+    assert roe_trend({}) == "ROE趋势：资料有缺口，暂不判断"
 
 
 def test_auth_boundaries() -> None:

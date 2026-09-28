@@ -355,8 +355,9 @@ def test_home_cards_show_each_company_date(tmp_path, monkeypatch):
         cards = [c for c in home.controls if isinstance(c, ft.Card)]
         assert len(cards) == 2
         for card, day in zip(cards, ("2026-09-20", "2026-09-21")):
-            label = card.content.content.controls[2].controls[0].value
-            assert f"数据日：{day} | 理由：测试" == label
+            texts = [c.value for c in app_controls(card) if isinstance(c, ft.Text)]
+            assert f"数据日：{day}" in texts
+            assert not any("理由" in str(t) for t in texts)
 
     asyncio.run(_test())
 
@@ -1072,15 +1073,19 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
         assert any("ROE 均值差" in t for t in texts)
         assert any("PB名次" in t for t in texts)
         assert not any("PB rank" in t for t in texts)
+        assert any("中位数 1.68 倍（4家，含本公司）" in t for t in texts)
+        assert any("ROE趋势（2023—2025）：连续上升" in t for t in texts)
+        assert any("尚未核查" in t and "现金流" in t for t in texts)
         await button("展开完整比较").on_click(None)
         page.views[0].on_scroll(SimpleNamespace(pixels=320))
         # Main order starts at company B. Joining is explicit and idempotent.
-        add = button("加入观察")
+        add = button("关注")
         await add.on_click(None)
         with connect_workspace(tmp_path, "demo") as conn:
             saved = get_watch_item(conn, "600002.SH")
         assert saved["ack_run_id"] is None
         assert saved["added_run_id"] == first
+        assert saved["revision"] == 1 and saved["reason"] == ""
         await add.on_click(None)  # This button now opens existing research.
         assert page.route == "/company/600002.SH"
         assert page.navigation_bar.selected_index == 1
@@ -1102,6 +1107,9 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
         # Browser navigation uses the same context, without a new submission.
         await page.on_route_change(SimpleNamespace(route="/company/600002.SH"))
         reason = next(c for c in controls() if isinstance(c, ft.TextField) and "理由" in c.label)
+        assert not reason.visible  # Merely following does not open a manual form.
+        await button("可选笔记、状态与已阅").on_click(None)
+        assert reason.visible
         reason.value = "未保存草稿"
         await page.on_route_change(SimpleNamespace(route=discover_route))
         assert page.dialog is not None
@@ -1114,10 +1122,18 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
             assert get_watch_item(conn, "600002.SH")["reason"] == ""
             assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 0
         # A detached old add callback cannot write after navigation.
-        stale_add = button("加入观察")
+        stale_add = button("关注")
         page.navigation_bar.selected_index = 0
         await page.navigation_bar.on_change(SimpleNamespace(control=page.navigation_bar))
         await stale_add.on_click(None)
+        # The new detail-page follow/toggle callbacks must also expire on navigation.
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        stale_follow = button("关注")
+        stale_toggle = button("可选笔记、状态与已阅")
+        await page.on_route_change(SimpleNamespace(route="/"))
+        await stale_follow.on_click(None)
+        await stale_toggle.on_click(None)
+        assert page.route == "/"
         with connect_workspace(tmp_path, "demo") as conn:
             assert conn.execute("SELECT count(*) FROM watch_items").fetchone()[0] == 1
         await page.on_close(None)
@@ -1182,6 +1198,7 @@ def test_removal_dialog_cancel_conflict_navigation_and_readd(tmp_path, monkeypat
             )
 
         await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+        await button("可选笔记、状态与已阅").on_click(None)
         delete = button("删除个人研究记录")
         await delete.on_click(None)
         cancelled_confirm = page.dialog.actions[1]
@@ -1223,7 +1240,8 @@ def test_removal_dialog_cancel_conflict_navigation_and_readd(tmp_path, monkeypat
             assert get_watch_item(conn, "600001.SH") is None
         await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
         assert not button("删除个人研究记录").visible
-        await button("保存判断").on_click(None)
+        await button("关注").on_click(None)
+        assert button("已关注").disabled
         assert button("删除个人研究记录").visible
         with connect_workspace(tmp_path, "demo") as conn:
             assert get_watch_item(conn, "600001.SH")["reason"] == ""
