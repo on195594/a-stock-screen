@@ -76,7 +76,8 @@ def build_app():
         page.title = "投研工作台"
         page.theme_mode = ft.ThemeMode.LIGHT
         page.fonts = {"NotoSansSC": "fonts/NotoSansSC-Regular.otf"}
-        page.theme = ft.Theme(font_family="NotoSansSC")
+        page.theme = ft.Theme(font_family="NotoSansSC", color_scheme_seed=ft.Colors.TEAL_700)
+        page.bgcolor = ft.Colors.GREY_50
         page.padding = 16
         page.scroll = ft.ScrollMode.AUTO
 
@@ -1686,7 +1687,12 @@ def build_app():
                 return str(value)
 
             comparison_rows: list[ft.Control] = []
-            full_comparison: list[ft.Control] = []
+            fact_groups: dict[str, list[ft.Control]] = {
+                "指标与公司状态": [],
+                "逐年财务资料": [],
+                "数据来源与范围": [],
+            }
+            missing_metadata: list[ft.Control] = []
             for item in comparison["items"]:
                 is_changed = bool(item["changed"] and ctx.get("ack_run_id"))
                 after = comparison_value(item["after"], item["label"], True)
@@ -1707,8 +1713,72 @@ def build_app():
                             border_radius=4,
                         )
                     )
+                label = item["label"]
+                is_annual = len(label) > 4 and label[:4].isdigit() and label[4] == "年"
+                group = (
+                    "逐年财务资料"
+                    if is_annual
+                    else "指标与公司状态"
+                    if label
+                    in ("估值日", "PB（倍）", "ROE三年均值（%）", "名称风险标记", "上市状态")
+                    else "数据来源与范围"
+                )
+                status = "变化" if is_changed else "未变" if ctx.get("ack_run_id") else "首次待阅"
+                field_controls: list[ft.Control] = [
+                    ft.Text(f"{label} · {status}", size=13, weight=ft.FontWeight.W_600),
+                    ft.Text(f"当前资料：{after}", size=14, selectable=True),
+                ]
+                if is_changed:
+                    field_controls.append(
+                        ft.Text(
+                            f"上次已阅：{comparison_value(item['before'], label, False)}",
+                            size=13,
+                            color=ft.Colors.GREY_800,
+                            selectable=True,
+                        )
+                    )
+                field = ft.Container(
+                    content=ft.Column(field_controls, spacing=6),
+                    bgcolor=ft.Colors.AMBER_50 if is_changed else ft.Colors.GREY_50,
+                    padding=12,
+                    border_radius=8,
+                )
+                if (
+                    is_annual
+                    and label.endswith(("报告类型", "修订标记"))
+                    and (item["before"] in (None, "") and item["after"] in (None, ""))
+                ):
+                    missing_metadata.append(field)
+                elif label == "本次范围成员":
+                    fact_groups[group].append(
+                        ft.ExpansionTile(
+                            title=f"本次范围成员 · {status}",
+                            controls=[field],
+                        )
+                    )
                 else:
-                    full_comparison.append(ft.Text(line, size=13, color=ft.Colors.GREY_800))
+                    fact_groups[group].append(field)
+
+            full_comparison: list[ft.Control] = []
+            for title, fields in fact_groups.items():
+                if fields:
+                    full_comparison.extend(
+                        [
+                            ft.Text(title, size=16, weight=ft.FontWeight.BOLD),
+                            ft.Column(
+                                fields,
+                                spacing=8,
+                                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                            ),
+                        ]
+                    )
+            if missing_metadata:
+                full_comparison.append(
+                    ft.ExpansionTile(
+                        title=f"未记录的补充字段（{len(missing_metadata)}项）",
+                        controls=missing_metadata,
+                    )
+                )
 
             comparison_key = (page_state["route"], "full_comparison")
             comparison_body = ft.Column(
@@ -1719,6 +1789,8 @@ def build_app():
                     ),
                     *full_comparison,
                 ],
+                spacing=16,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 visible=page_state["expanded_sections"].get(comparison_key, False),
             )
 
@@ -2083,7 +2155,7 @@ def build_app():
                                     ),
                                     comparison_summary,
                                     *comparison_rows,
-                                    ft.Button("来源与完整对照", on_click=toggle_comparison),
+                                    ft.Button("查看全部字段与来源", on_click=toggle_comparison),
                                     comparison_body,
                                     ft.Text(
                                         f"核查状态：{financial_status}；核查时间：{usable.get('financial_checked_at') or '资料未记录'}",

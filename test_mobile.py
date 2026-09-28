@@ -274,12 +274,23 @@ def main() -> int:
                 expect(
                     page.get_by_text("当前资料（首次待阅，无已阅基准）", exact=True)
                 ).to_be_visible()
-                metadata = page.get_by_text("2025年报告类型：当前资料未记录", exact=True)
+                fields = page.get_by_role("button", name="查看全部字段与来源", exact=True)
+                group = page.get_by_text("指标与公司状态", exact=True)
+                expect(group).not_to_be_visible()
+                fields.click()
+                expect(group).to_be_visible()
+                expect(page.get_by_text("PB（倍） · 首次待阅", exact=True)).to_be_visible()
+                metadata = page.get_by_text("2025年报告类型 · 首次待阅", exact=True)
                 expect(metadata).not_to_be_visible()
-                page.get_by_role("button", name="来源与完整对照", exact=True).click()
+                missing = page.get_by_text("未记录的补充字段（", exact=False)
+                missing.scroll_into_view_if_needed()
+                time.sleep(0.5)
+                missing.click()
                 expect(metadata).to_be_visible()
-                page.get_by_role("button", name="来源与完整对照", exact=True).click()
-                expect(metadata).not_to_be_visible()
+                fields.scroll_into_view_if_needed()
+                time.sleep(0.5)
+                fields.click()
+                expect(group).not_to_be_visible()
                 # Following is complete without a form; old notes are optional and preserved.
                 expect(page.locator("textarea[aria-label*='理由']").first).not_to_be_visible()
                 open_notes()
@@ -291,6 +302,7 @@ def main() -> int:
                 next_step = "核查经营现金流与利润差异"
                 next_input = page.get_by_role("textbox", name="下一步核查提示", exact=False)
                 next_input.scroll_into_view_if_needed()
+                time.sleep(0.5)  # Wait for Flutter scrolling before hitting the input.
                 next_input.click()
                 time.sleep(0.5)  # Allow Flutter's single-line editor focus to synchronize.
                 next_input.press_sequentially(next_step, delay=40)

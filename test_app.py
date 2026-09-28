@@ -1346,6 +1346,17 @@ def test_company_changed_ack_requires_displayed_comparison(tmp_path, monkeypatch
         assert highlight.bgcolor == ft.Colors.AMBER_50
         assert highlight.content.weight == ft.FontWeight.W_600
         assert "【变化】2025年ROE（%）：15.8 → 16.5" in texts
+        assert "PB（倍） · 变化" in texts
+        assert "当前资料：1.8" in texts
+        assert "上次已阅：1.85" in texts
+        assert "2025年ROE（%） · 变化" in texts
+        assert "上次已阅：15.8" in texts
+        # The expanded view is complete, including changes already summarized above.
+        assert "上市状态 · 未变" in texts
+        assert any(
+            isinstance(c, ft.ExpansionTile) and str(c.title).startswith("本次范围成员")
+            for c in controls
+        )
         with connect_workspace(tmp_path, "demo") as conn:
             assert get_watch_item(conn, "600001.SH")["ack_run_id"] == first
         await ack.on_click(None)
@@ -1519,7 +1530,7 @@ def test_first_review_shows_current_facts_and_folds_missing_metadata(tmp_path, m
         await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
         controls = list(app_controls(page.controls[0]))
         toggle = next(
-            c for c in controls if isinstance(c, ft.Button) and c.content == "来源与完整对照"
+            c for c in controls if isinstance(c, ft.Button) and c.content == "查看全部字段与来源"
         )
         body = next(
             c
@@ -1532,11 +1543,19 @@ def test_first_review_shows_current_facts_and_folds_missing_metadata(tmp_path, m
         assert body.visible is False
         texts = [str(c.value) for c in controls if isinstance(c, ft.Text)]
         assert "当前资料（首次待阅，无已阅基准）" in texts
-        assert "PB（倍）：1.85" in texts
+        assert "PB（倍） · 首次待阅" in texts
+        assert "当前资料：1.85" in texts
+        assert not any(t.startswith("上次已阅：") for t in texts)
+        assert {"指标与公司状态", "逐年财务资料", "数据来源与范围"} <= set(texts)
         assert not any("未提供/不适用" in t or " → " in t for t in texts)
         await toggle.on_click(None)
         assert body.visible is True
-        assert "2025年报告类型：当前资料未记录" in texts
+        assert "2025年报告类型 · 首次待阅" in texts
+        assert "当前资料：当前资料未记录" in texts
+        assert any(
+            isinstance(c, ft.ExpansionTile) and str(c.title).startswith("未记录的补充字段")
+            for c in controls
+        )
         await page.on_close(None)
 
     asyncio.run(check())
