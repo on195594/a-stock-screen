@@ -103,6 +103,30 @@ def build_app():
         content_container = ft.Container(expand=True)
         login_msg = ft.Text("", size=13, color=ft.Colors.RED_700)
 
+        def remember_draft() -> None:
+            getter = page_state.get("current_form_getter")
+            code = page_state.get("current_company_code")
+            baseline = page_state.get("current_form_baseline")
+            if not callable(getter) or not code or baseline is None:
+                return
+            current = getter()
+            drafts = page_state["drafts"]
+            existing = drafts.get(code, {})
+            revision = page_state["current_company_revision"]
+            updated_at = page_state.get("current_company_updated_at")
+            base_revision = existing.get("_base_revision")
+            conflict = (base_revision is not None and base_revision != revision) or (
+                "_base_updated_at" in existing and existing["_base_updated_at"] != updated_at
+            )
+            if current != baseline or conflict:
+                drafts[code] = {
+                    **current,
+                    "_base_revision": base_revision if base_revision is not None else revision,
+                    "_base_updated_at": existing.get("_base_updated_at", updated_at),
+                }
+            else:
+                drafts.pop(code, None)
+
         async def navigate(route: str, *, from_browser: bool = False):
             if page_state.pop("removal_dialog", False):
                 page.pop_dialog()
@@ -1554,32 +1578,8 @@ def build_app():
             page_state["current_form_getter"] = get_current_form
 
             def update_draft(e: Any = None) -> None:
-                current = get_current_form()
-                existing_draft = page_state.get("drafts", {}).get(code)
-                existing_base = existing_draft.get("_base_revision") if existing_draft else None
-                base_rev = (
-                    existing_base
-                    if existing_base is not None
-                    else page_state.get("current_company_revision", ctx.get("revision", 0))
-                )
-                current_rev = page_state.get("current_company_revision", ctx.get("revision", 0))
-                is_conflict = (existing_base is not None and existing_base != current_rev) or bool(
-                    existing_draft
-                    and "_base_updated_at" in existing_draft
-                    and existing_draft["_base_updated_at"] != ctx.get("updated_at")
-                )
-                is_modified = current != page_state.get("current_form_baseline")
-
-                if is_modified or is_conflict:
-                    page_state.setdefault("drafts", {})[code] = {
-                        **current,
-                        "_base_revision": base_rev,
-                        "_base_updated_at": existing_draft.get("_base_updated_at")
-                        if existing_draft
-                        else ctx.get("updated_at"),
-                    }
-                else:
-                    page_state.setdefault("drafts", {}).pop(code, None)
+                if gen == page_state["generation"] and actor.is_valid and page_state["connected"]:
+                    remember_draft()
 
             status_dd.on_select = update_draft
             reason_field.on_change = update_draft
@@ -2328,36 +2328,10 @@ def build_app():
                 poll.cancel()
                 page_state["job_poll_task"] = None
             page_state["generation"] += 1
-            if callable(page_state.get("current_form_getter")) and page_state.get(
-                "current_company_code"
-            ):
-                active_c = page_state["current_company_code"]
-                baseline = page_state.get("current_form_baseline")
-                existing_draft = page_state.get("drafts", {}).get(active_c)
-                existing_base = existing_draft.get("_base_revision") if existing_draft else None
-                current_rev = page_state.get("current_company_revision", 0)
-                base_rev = existing_base if existing_base is not None else current_rev
-                is_conflict = (existing_base is not None and existing_base != current_rev) or bool(
-                    existing_draft
-                    and "_base_updated_at" in existing_draft
-                    and existing_draft["_base_updated_at"]
-                    != page_state.get("current_company_updated_at")
-                )
-                try:
-                    curr = page_state["current_form_getter"]()
-                    is_modified = baseline is not None and curr != baseline
-                    if is_modified or is_conflict:
-                        page_state.setdefault("drafts", {})[active_c] = {
-                            **curr,
-                            "_base_revision": base_rev,
-                            "_base_updated_at": existing_draft.get("_base_updated_at")
-                            if existing_draft
-                            else page_state.get("current_company_updated_at"),
-                        }
-                    else:
-                        page_state.setdefault("drafts", {}).pop(active_c, None)
-                except Exception:
-                    pass
+            try:
+                remember_draft()
+            except Exception:
+                pass
             if watchdog_task is not None:
                 watchdog_task.cancel()
                 watchdog_task = None

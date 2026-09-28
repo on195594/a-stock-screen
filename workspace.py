@@ -1351,16 +1351,6 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def get_latest_peer_run(conn: sqlite3.Connection, anchor_code: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        """SELECT * FROM screen_runs
-        WHERE kind='peer' AND anchor_code=? AND health='complete'
-        ORDER BY valuation_date DESC, captured_at DESC, run_id DESC LIMIT 1""",
-        (anchor_code,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
 def list_runs(conn: sqlite3.Connection, kind: str | None = None) -> list[dict[str, Any]]:
     if kind:
         rows = conn.execute(

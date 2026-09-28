@@ -6,11 +6,12 @@ from pathlib import Path
 import pytest
 
 import screen
+from auth import create_demo_actor
+from services import get_peer_discover
 from workspace import (
     WorkspaceError,
     add_watch_item,
     connect_workspace,
-    get_latest_peer_run,
     get_run,
     get_watch_item,
     import_snapshot,
@@ -263,10 +264,8 @@ def test_snapshot_import_and_deduplication(tmp_path: Path) -> None:
         assert run["valuation_date"] == "2026-09-20"
         assert Path(ws_dir / run["snapshot_path"]).is_file()
 
-        # Query latest peer run
-        latest = get_latest_peer_run(conn, "600001.SH")
-        assert latest is not None
-        assert latest["run_id"] == run_id1
+        board = get_peer_discover(create_demo_actor(), "600001.SH", ws_dir, "demo")
+        assert board["run_id"] == run_id1
 
         runs = list_runs(conn, kind="peer")
         assert len(runs) == 1
@@ -316,7 +315,7 @@ def test_unverified_rule_snapshot(tmp_path: Path) -> None:
         assert run["health"] == "unverified"
         assert run["rule_id"] == "peer-screen-v0-legacy"
 
-        assert get_latest_peer_run(conn, "600001.SH") is None
+        assert not get_peer_discover(create_demo_actor(), "600001.SH", ws_dir, "demo")["has_run"]
     finally:
         conn.close()
 
@@ -850,9 +849,7 @@ def test_native_screen_snapshot_import_complete(tmp_path: Path) -> None:
         assert run["anchor_code"] == anchor
         assert run["valuation_date"] == "2026-09-20"
 
-        latest = get_latest_peer_run(conn, anchor)
-        assert latest is not None
-        assert latest["run_id"] == run_id
+        assert get_peer_discover(create_demo_actor(), anchor, ws_dir, "demo")["run_id"] == run_id
 
         # Verify native screen.py snapshot can be marked as acknowledged
         add_watch_item(conn, code="600001.SH", name="真实标的甲", added_run_id=run_id)
@@ -866,7 +863,6 @@ def test_native_screen_snapshot_import_complete(tmp_path: Path) -> None:
         assert rev2 == 2
 
         # Verify get_company_context correctly extracts 4-digit years from period
-        from auth import create_demo_actor
         from services import get_company_context
 
         ctx = get_company_context(
@@ -880,647 +876,41 @@ def test_native_screen_snapshot_import_complete(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_tampered_ranking_metadata_degrades_to_unverified(tmp_path: Path) -> None:
-    ws_dir = tmp_path / "tamper_meta_ws"
-    initialize(ws_dir, mode="demo", journal_mode="DELETE")
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        pytest.param(("results", "anchor_position"), 99, id="anchor-position"),
+        pytest.param(("results", "top"), None, id="missing-top"),
+        pytest.param(("results", "rows"), [{"code": "600001.SH", "pb": 99.99}], id="rows-mismatch"),
+        pytest.param(("source",), None, id="missing-source"),
+        pytest.param(("source",), "unknown", id="unknown-source"),
+        pytest.param(("limits", "cap"), 100, id="invalid-cap"),
+        pytest.param(("scope",), {"source": "tracker"}, id="missing-scope-evidence"),
+        pytest.param(("results", "ranking", 0, "name"), "篡改名称", id="ranking-name"),
+    ],
+)
+def test_import_rejects_tampered_metadata(tmp_path: Path, field, value) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    snapshot = _make_valid_test_snapshot()
+    path = tmp_path / "candidate.json"
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    valid = import_snapshot(tmp_path, path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert present(get_run(conn, valid))["health"] == "complete"
 
-    anchor = "600001.SH"
-    watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "真实标的甲",
-            "pb": 2.10,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-15",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-20",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-        },
-        {
-            "code": "600002.SH",
-            "name": "真实标的乙",
-            "pb": 1.50,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-10",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-12",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-        },
-    ]
-
-    results = screen.rank_peers(rows, anchor, watchlist)
-    # Tamper with anchor_position: claim position 99 instead of true position
-    tampered_results = dict(results)
-    tampered_results["anchor_position"] = 99
-
-    snapshot_data = {
-        "schema_version": 1,
-        "rule": "peer-screen-v1",
-        "limits": {"cap": 50, "top_n": 3, "max_report_age_days": 550},
-        "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
-        "screened_at": "2026-09-20T16:00:00+08:00",
-        "generated_at": "2026-09-20T16:00:00+08:00",
-        "data_date": "2026-09-20",
-        "anchor": anchor,
-        "watchlist_codes": watchlist,
-        "source": "screen_test",
-        "scope": {"source": "screen_test", "total_candidates": 2},
-        "rows": rows,
-        "results": tampered_results,
-    }
-
-    snap_file = tmp_path / "tampered_snapshot.json"
-    snap_file.write_text(json.dumps(snapshot_data, ensure_ascii=False), encoding="utf-8")
-
-    run_id = import_snapshot(ws_dir, snap_file, mode="demo")
-
-    conn = connect_workspace(ws_dir, mode="demo")
-    try:
-        run = get_run(conn, run_id)
-        assert run is not None
-        assert run["health"] == "unverified"
-
-        # Omitting required metadata key (e.g. 'top') degrades to unverified
-        missing_key_results = dict(results)
-        del missing_key_results["top"]
-        snapshot_data["results"] = missing_key_results
-        snap_file2 = tmp_path / "missing_top_snapshot.json"
-        snap_file2.write_text(json.dumps(snapshot_data, ensure_ascii=False), encoding="utf-8")
-        run_id2 = import_snapshot(ws_dir, snap_file2, mode="demo")
-        run2 = get_run(conn, run_id2)
-        assert run2 is not None
-        assert run2["health"] == "unverified"
-    finally:
-        conn.close()
-
-
-def test_results_rows_mismatch_degrades_to_unverified(tmp_path: Path) -> None:
-    ws_dir = tmp_path / "mismatch_ws"
-    initialize(ws_dir, mode="demo", journal_mode="DELETE")
-
-    anchor = "600001.SH"
-    watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "真实标的甲",
-            "pb": 2.10,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-15",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-20",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-        },
-        {
-            "code": "600002.SH",
-            "name": "真实标的乙",
-            "pb": 1.50,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-10",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-12",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-        },
-    ]
-
-    results = dict(screen.rank_peers(rows, anchor, watchlist))
-    # Inject an inconsistent results.rows that diverges from top-level rows
-    results["rows"] = [
-        {
-            "code": "600001.SH",
-            "name": "虚假标的甲",
-            "pb": 99.99,
-            "annual_roes": [],
-            "roe_mean": 99.99,
-            "exclusions": [],
-        }
-    ]
-
-    snapshot_data = {
-        "schema_version": 1,
-        "rule": "peer-screen-v1",
-        "limits": {"cap": 50, "top_n": 3, "max_report_age_days": 550},
-        "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
-        "screened_at": "2026-09-20T16:00:00+08:00",
-        "generated_at": "2026-09-20T16:00:00+08:00",
-        "data_date": "2026-09-20",
-        "anchor": anchor,
-        "watchlist_codes": watchlist,
-        "source": "screen_test",
-        "scope": {"source": "screen_test", "total_candidates": 2},
-        "rows": rows,
-        "results": results,
-    }
-
-    snap_file = tmp_path / "mismatch_rows_snapshot.json"
-    snap_file.write_text(json.dumps(snapshot_data, ensure_ascii=False), encoding="utf-8")
-
-    run_id = import_snapshot(ws_dir, snap_file, mode="demo")
-
-    conn = connect_workspace(ws_dir, mode="demo")
-    try:
-        run = get_run(conn, run_id)
-        assert run is not None
-        assert run["health"] == "unverified"
-    finally:
-        conn.close()
-
-
-def test_unknown_or_missing_source_degrades_to_unverified(tmp_path: Path) -> None:
-    ws_dir = tmp_path / "unknown_src_ws"
-    initialize(ws_dir, mode="demo", journal_mode="DELETE")
-
-    anchor = "600001.SH"
-    watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "真实标的甲",
-            "pb": 2.10,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-15",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-20",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-        },
-        {
-            "code": "600002.SH",
-            "name": "真实标的乙",
-            "pb": 1.50,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-10",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-12",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-        },
-    ]
-
-    results = screen.rank_peers(rows, anchor, watchlist)
-
-    # 1. Missing source and missing scope source
-    snapshot_unknown = {
-        "schema_version": 1,
-        "rule": "peer-screen-v1",
-        "limits": {"cap": 50, "top_n": 3, "max_report_age_days": 550},
-        "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
-        "screened_at": "2026-09-20T16:00:00+08:00",
-        "generated_at": "2026-09-20T16:00:00+08:00",
-        "data_date": "2026-09-20",
-        "anchor": anchor,
-        "watchlist_codes": watchlist,
-        "rows": rows,
-        "results": results,
-    }
-
-    snap_file = tmp_path / "unknown_src_snapshot.json"
-    snap_file.write_text(json.dumps(snapshot_unknown, ensure_ascii=False), encoding="utf-8")
-
-    run_id = import_snapshot(ws_dir, snap_file, mode="demo")
-
-    conn = connect_workspace(ws_dir, mode="demo")
-    try:
-        run = get_run(conn, run_id)
-        assert run is not None
-        assert run["health"] == "unverified"
-
-        # 2. Explicit 'unknown' source also degrades to unverified
-        snapshot_unknown["source"] = "unknown"
-        snapshot_unknown["scope"] = {"source": "unknown"}
-        snap_file2 = tmp_path / "explicit_unknown_src_snapshot.json"
-        snap_file2.write_text(json.dumps(snapshot_unknown, ensure_ascii=False), encoding="utf-8")
-        run_id2 = import_snapshot(ws_dir, snap_file2, mode="demo")
-        run2 = get_run(conn, run_id2)
-        assert run2 is not None
-        assert run2["health"] == "unverified"
-    finally:
-        conn.close()
-
-
-def test_invalid_limits_degrades_to_unverified(tmp_path: Path) -> None:
-    ws_dir = tmp_path / "invalid_limits_ws"
-    initialize(ws_dir, mode="demo", journal_mode="DELETE")
-
-    anchor = "600001.SH"
-    watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "真实标的甲",
-            "pb": 2.10,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-15",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-20",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-        },
-        {
-            "code": "600002.SH",
-            "name": "真实标的乙",
-            "pb": 1.50,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-10",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-12",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-        },
-    ]
-
-    results = screen.rank_peers(rows, anchor, watchlist)
-    # Incorrect limits deviating from peer-screen-v1 standard (e.g. cap=100 instead of 50)
-    snapshot_data = {
-        "schema_version": 1,
-        "rule": "peer-screen-v1",
-        "limits": {"cap": 100, "top_n": 3, "max_report_age_days": 550},
-        "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
-        "screened_at": "2026-09-20T16:00:00+08:00",
-        "generated_at": "2026-09-20T16:00:00+08:00",
-        "data_date": "2026-09-20",
-        "anchor": anchor,
-        "watchlist_codes": watchlist,
-        "source": "screen_test",
-        "scope": {"source": "screen_test", "total_candidates": 2},
-        "rows": rows,
-        "results": results,
-    }
-
-    snap_file = tmp_path / "invalid_limits.json"
-    snap_file.write_text(json.dumps(snapshot_data, ensure_ascii=False), encoding="utf-8")
-
-    run_id = import_snapshot(ws_dir, snap_file, mode="demo")
-
-    conn = connect_workspace(ws_dir, mode="demo")
-    try:
-        run = get_run(conn, run_id)
-        assert run is not None
-        assert run["health"] == "unverified"
-    finally:
-        conn.close()
-
-
-def test_missing_scope_evidence_degrades_to_unverified(tmp_path: Path) -> None:
-    ws_dir = tmp_path / "missing_scope_ws"
-    initialize(ws_dir, mode="demo", journal_mode="DELETE")
-
-    anchor = "600001.SH"
-    watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "真实标的甲",
-            "pb": 2.10,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-15",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-20",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-        },
-        {
-            "code": "600002.SH",
-            "name": "真实标的乙",
-            "pb": 1.50,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-10",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-12",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-        },
-    ]
-
-    results = screen.rank_peers(rows, anchor, watchlist)
-    # Scope without candidate counts cannot prove complete enumeration
-    snapshot_data = {
-        "schema_version": 1,
-        "rule": "peer-screen-v1",
-        "limits": {"cap": 50, "top_n": 3, "max_report_age_days": 550},
-        "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
-        "screened_at": "2026-09-20T16:00:00+08:00",
-        "generated_at": "2026-09-20T16:00:00+08:00",
-        "data_date": "2026-09-20",
-        "anchor": anchor,
-        "watchlist_codes": watchlist,
-        "source": "screen_test",
-        "scope": {"source": "screen_test"},
-        "rows": rows,
-        "results": results,
-    }
-
-    snap_file = tmp_path / "missing_scope.json"
-    snap_file.write_text(json.dumps(snapshot_data, ensure_ascii=False), encoding="utf-8")
-
-    run_id = import_snapshot(ws_dir, snap_file, mode="demo")
-
-    conn = connect_workspace(ws_dir, mode="demo")
-    try:
-        run = get_run(conn, run_id)
-        assert run is not None
-        assert run["health"] == "unverified"
-    finally:
-        conn.close()
-
-
-def test_ranking_name_conflict_degrades_to_unverified(tmp_path: Path) -> None:
-    ws_dir = tmp_path / "name_conflict_ws"
-    initialize(ws_dir, mode="demo", journal_mode="DELETE")
-
-    anchor = "600001.SH"
-    watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "真实标的甲",
-            "pb": 2.10,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-15",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-20",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-        },
-        {
-            "code": "600002.SH",
-            "name": "真实标的乙",
-            "pb": 1.50,
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2024-04-10",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2025-04-12",
-                    "update_flag": "0",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "source": "tracker",
-                    "ann_date": "2026-04-15",
-                    "update_flag": "0",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-        },
-    ]
-
-    results = screen.rank_peers(rows, anchor, watchlist)
-    # Tamper with ranking company name
-    tampered_results = json.loads(json.dumps(results))
-    tampered_results["ranking"][0]["name"] = "被篡改的公司名"
-
-    snapshot_data = {
-        "schema_version": 1,
-        "rule": "peer-screen-v1",
-        "limits": {"cap": 50, "top_n": 3, "max_report_age_days": 550},
-        "formula": "research_order=(roe_rank_desc+pb_rank_asc)/2; average ties",
-        "screened_at": "2026-09-20T16:00:00+08:00",
-        "generated_at": "2026-09-20T16:00:00+08:00",
-        "data_date": "2026-09-20",
-        "anchor": anchor,
-        "watchlist_codes": watchlist,
-        "source": "screen_test",
-        "scope": {"source": "screen_test", "total_candidates": 2},
-        "rows": rows,
-        "results": tampered_results,
-    }
-
-    snap_file = tmp_path / "name_conflict.json"
-    snap_file.write_text(json.dumps(snapshot_data, ensure_ascii=False), encoding="utf-8")
-
-    run_id = import_snapshot(ws_dir, snap_file, mode="demo")
-
-    conn = connect_workspace(ws_dir, mode="demo")
-    try:
-        run = get_run(conn, run_id)
-        assert run is not None
-        assert run["health"] == "unverified"
-    finally:
-        conn.close()
+    # Prove the intended mutation fails, not an already-invalid source or row fixture.
+    target = snapshot
+    for key in field[:-1]:
+        target = target[key]
+    if value is None:
+        del target[field[-1]]
+    else:
+        target[field[-1]] = value
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    invalid = import_snapshot(tmp_path, path, "demo")
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert invalid != valid
+        assert present(get_run(conn, invalid))["health"] == "unverified"
 
 
 def test_live_snapshot_output_shape_import_complete(tmp_path: Path) -> None:
@@ -2373,76 +1763,50 @@ def test_scope_selected_codes_mismatched_exchange_suffix_degrades_to_unverified(
 def _make_valid_test_snapshot():
     anchor = "600001.SH"
     watchlist = [screen.base_code(anchor)]
-    rows = [
-        {
-            "code": "600001.SH",
-            "name": "标的甲",
-            "pb": 1.80,
-            "valuation_date": "2026-09-20",
-            "valuation_source": "tracker",
-            "financial_source": "tracker",
-            "risk_source": "tracker",
-            "valuation_status": "ok",
-            "financial_status": "ok",
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 12.0,
-                    "ann_date": "2024-04-15",
-                    "source": "tracker",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 14.0,
-                    "ann_date": "2025-04-20",
-                    "source": "tracker",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 16.0,
-                    "ann_date": "2026-04-15",
-                    "source": "tracker",
-                },
-            ],
-            "roe_mean": 14.0,
-            "exclusions": [],
-            "facts_usable": True,
-        },
-        {
-            "code": "600002.SH",
-            "name": "标的乙",
-            "pb": 1.20,
-            "valuation_date": "2026-09-20",
-            "valuation_source": "tracker",
-            "financial_source": "tracker",
-            "risk_source": "tracker",
-            "valuation_status": "ok",
-            "financial_status": "ok",
-            "annual_roes": [
-                {
-                    "period": "20231231",
-                    "roe_waa": 15.0,
-                    "ann_date": "2024-04-10",
-                    "source": "tracker",
-                },
-                {
-                    "period": "20241231",
-                    "roe_waa": 15.0,
-                    "ann_date": "2025-04-12",
-                    "source": "tracker",
-                },
-                {
-                    "period": "20251231",
-                    "roe_waa": 15.0,
-                    "ann_date": "2026-04-15",
-                    "source": "tracker",
-                },
-            ],
-            "roe_mean": 15.0,
-            "exclusions": [],
-            "facts_usable": True,
-        },
-    ]
+    rows = []
+    for code, name, pb, roes, announcements in (
+        (
+            "600001.SH",
+            "标的甲",
+            1.8,
+            (12.0, 14.0, 16.0),
+            ("2024-04-15", "2025-04-20", "2026-04-15"),
+        ),
+        (
+            "600002.SH",
+            "标的乙",
+            1.2,
+            (15.0, 15.0, 15.0),
+            ("2024-04-10", "2025-04-12", "2026-04-15"),
+        ),
+    ):
+        rows.append(
+            {
+                "code": code,
+                "name": name,
+                "pb": pb,
+                "valuation_date": "2026-09-20",
+                "valuation_source": "tracker",
+                "financial_source": "tracker",
+                "risk_source": "tracker",
+                "valuation_status": "ok",
+                "financial_status": "ok",
+                "annual_roes": [
+                    {
+                        "period": f"{year}1231",
+                        "roe_waa": roe,
+                        "ann_date": announced,
+                        "source": "tracker",
+                    }
+                    for year, roe, announced in zip(
+                        (2023, 2024, 2025), roes, announcements, strict=True
+                    )
+                ],
+                "roe_mean": sum(roes) / len(roes),
+                "exclusions": [],
+                "facts_usable": True,
+            }
+        )
     results = screen.rank_peers(rows, anchor, watchlist)
     return {
         "schema_version": 1,
@@ -2917,8 +2281,7 @@ def test_screen_generated_snapshot_with_exclusions_and_errors_health_classificat
         run = get_run(connect_workspace(ws_dir, "demo"), import_snapshot(ws_dir, path, "demo"))
         assert run is not None and run["health"] == ("unverified" if field == "pb" else "partial")
         assert (
-            present(get_latest_peer_run(connect_workspace(ws_dir, "demo"), anchor))["run_id"]
-            == run_comp_id
+            get_peer_discover(create_demo_actor(), anchor, ws_dir, "demo")["run_id"] == run_comp_id
         )
 
     # ST cannot mask a missing PB or missing financial data; neither can invalid PB
@@ -2940,8 +2303,7 @@ def test_screen_generated_snapshot_with_exclusions_and_errors_health_classificat
             "unverified" if field == "pb" and index == 2 else "partial"
         )
         assert (
-            present(get_latest_peer_run(connect_workspace(ws_dir, "demo"), anchor))["run_id"]
-            == run_comp_id
+            get_peer_discover(create_demo_actor(), anchor, ws_dir, "demo")["run_id"] == run_comp_id
         )
 
     for source in ("valuation_source", "financial_source", "risk_source"):

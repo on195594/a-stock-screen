@@ -1704,3 +1704,38 @@ def test_home_tiered_grouping_and_styling(tmp_path, monkeypatch):
                         assert text_c.color == ft.Colors.GREY_700
 
     asyncio.run(check())
+
+
+def test_stale_editor_cannot_replace_reconnected_draft(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    import_snapshot(
+        tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
+    )
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
+
+        def reason_field():
+            return next(
+                c
+                for c in app_controls(page.controls[0])
+                if isinstance(c, ft.TextField) and c.label.startswith("一句理由")
+            )
+
+        old_editor = reason_field()
+        old_editor.value = "保留的草稿"
+        old_editor.on_change(None)
+        await page.on_disconnect(None)
+        await page.on_connect(None)
+        old_editor.value = "旧页面延迟事件"
+        old_editor.on_change(None)
+        await page.on_disconnect(None)
+        await page.on_connect(None)
+        assert reason_field().value == "保留的草稿"
+        await page.on_close(None)
+
+    asyncio.run(check())

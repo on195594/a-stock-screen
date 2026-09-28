@@ -1,38 +1,26 @@
 # 文档导航
 
-- [项目使用说明](../README.md)：实际入口、当前功能与限制。
-- [开发约束](../AGENTS.md)：数据边界、鉴权、安全与验收要求。
-- [Flet 设计（spec 1.2）](FLET_DESIGN.md)：路线C关注优先、事实解读、结果状态、可选笔记与三表安全合同；是目标，不代表已实现或生产验收。
-- [实施路线图1.2](CODEX_IMPLEMENTATION.md)：在现有代码上按 **S1扫描看得懂 → S2持续研究 → S3真机与生产验收** 交付；含差量范围、用户任务U01—U06和安全测试A01—A12。
+- [项目使用说明](../README.md)：实际入口、当前功能、维护命令与限制。
+- [开发约束](../AGENTS.md)：数据边界、鉴权、安全与交付要求。
+- [设计与实施边界](FLET_DESIGN.md)：唯一维护的合同/计划；§1说明当前能力与限制，§8只保留下一阶段和验收底线，历史实施流水查Git。
+- [下一阶段任务](FLET_DESIGN.md#next-stage)：一次只实施一个获准切片；下一项为S3-R1可靠性与可恢复反馈。
+- [验收矩阵](FLET_DESIGN.md#acceptance)：用户任务U01—U08、安全与数据合同A01—A12；代码通过不等于部署或本人验收。
 
-## 当前代码布局
+## 代码布局
 
 | 路径 | 用途 |
 |---|---|
-| `screen.py` / `test_screen.py` | 原有 peer-screen-v1 CLI 与算法测试 |
-| `workspace.py` / `manage.py` | 三表工作区、快照导入、demo 初始化 |
-| `services.py` / `auth.py` / `app.py` / `worker.py` / `watch.py` | 查询与个人记录、鉴权、Flet Web/ASGI、独立按需peer/watch worker、固定代码事实采集与验证 |
-| `test_workspace.py` / `test_services.py` / `test_app.py` / `test_worker.py` | 离线工作区、服务、Web 与任务恢复测试 |
-| `test_mobile.py` / `tests/fixtures/` | 浏览器端到端脚本与合成快照 |
-| `Makefile` / `pyproject.toml` / `uv.lock` | 运行与依赖锁定 |
-| `deploy.sh` / `test_deploy.py` | 本机一键部署、隔离的部署流程测试；用法见[项目说明](../README.md) |
-| `Dockerfile` / `docker-compose.yml` / `docker/` | 本机 Docker Compose + Nginx 部署配置；匿名入口可达，不等于生产 OAuth 或移动真机验收 |
+| `screen.py` / `test_screen.py` | 原peer-screen-v1 CLI与算法测试 |
+| `workspace.py` / `manage.py` | 三表工作区、快照导入、demo与维护命令；完整榜选择统一走`services.get_peer_discover` |
+| `services.py` / `auth.py` / `app.py` | 私人查询/记录、鉴权、Flet Web/ASGI |
+| `worker.py` / `watch.py` | 独立按需peer/watch任务与固定代码事实采集/验证 |
+| `maintenance.py` / `test_maintenance.py` | 只读源库备份、新目录隔离恢复及测试 |
+| `test_workspace.py` / `test_services.py` / `test_app.py` / `test_worker.py` | 离线工作区、服务、Web与任务恢复测试 |
+| `test_mobile.py` / `tests/fixtures/` | 动态Web端到端浏览器流程与合成快照 |
+| `Makefile` / `pyproject.toml` / `uv.lock` | 运行入口与独立依赖锁定 |
+| `deploy.sh` / `test_deploy.py` | 部署脚本与隔离流程测试；执行需明确授权 |
+| `Dockerfile` / `docker-compose.yml` / `docker/` | Docker Compose与Nginx部署配置 |
 
-测试脚本保留在根目录，避免破坏 `AGENTS.md` 和现有 `make check` 的入口；`tests/` 仅存合成 fixture。
+测试脚本保留在根目录，`tests/`仅存合成fixture。日常使用见项目README；设计、任务、验收与研究取舍只在设计文档维护，不在导航重复记进度。
 
-## 工作区进度记录（截至2026-09-28；实施起点4024cb6）
-
-- **已有工程基础**：合成demo、同业扫描worker、公司事实、个人记录、部分比较/已阅逻辑及隔离测试。保留`make check`和390px Chromium流程，但它们不代表本轮新增用户任务已通过。
-- **S1候选已接通**：实际指标与前三＋参照、来源/排除与完整比较、空结果和partial/旧榜关系、指定任务结果、一键关注及浏览器返回。补同源中文字体，不改算法/表结构；有旧ack但缺变化对照时限制确认。`make check`及360/390/430px浏览器流程已实际通过；本人能否独立解释研究依据仍pending。
-- **S1试用补差（2026-09-25）**：详情可确认删除个人记录；失败/中断任务可确认从列表清理并保留防重放记录。共享快照不删除，旧页不得覆盖删除后重新加入的记录。197项检查及扩展浏览器删除/取消/重新加入/清理流程通过。所有者选择生产入口试用；部署及本人验收仍需分别核验。
-- **路线C第一切片（2026-09-28）**：所有者确认关注优先、固定模板事实解读；一键关注不要求笔记，历史内容保留在可选区。PB同快照中位数、年度ROE趋势和未核查项不改变原排序；不接AI、不自动更新、不部署。213项检查及360/390/430px合成浏览器流程通过，边界与未验收项见路线图。
-- **S2首个切片**：详情已接通实际已阅基准→当前资料的逐项对照和显式确认；缺口或基准损坏时禁确认，不替换基准，保存笔记不推进ack。验证记录见路线图。
-- **S2首页切片**：需要复看/暂无未阅变化分组，暂停默认折叠且不计入待复看数；首页暂停/恢复为观察保留笔记与已阅基准，不触发数据任务。232项检查及含刷新后的暂停/恢复浏览器流程通过，详见路线图。
-- **S2固定更新与分层切片**：首页更新冻结未暂停的1—50家公司；worker只取固定代码事实、不排名。首页实现四层事实分层（数据异常置顶、重要事实变动橙字加粗、仅数据日更新中性蓝灰、暂无变化常规灰）；暂停默认折叠且不计入待复看数。261项检查、7文件mypy及移动尺寸浏览器流程通过；真实TuShare/生产/真机仍pending，未部署。
-- **S2验收修复**：本人反馈详情空值噪声、无配置的设置页、重新扫描未提交任务。候选修复为折叠附加对照、账户与运行信息更名、确认重扫后真正提交任务；需修复后再验收，不再将自动化通过称为S2全部闭合。
-- **S2变化合同/S3恢复切片**：风险/上市状态变化进入首页及已阅对照；首页复用详情口径，PB变化中性命名；已有下一步摘要帮助继续研究；修复周末及周一盘中日历跨周末误报。已只读检查现有生产快照，并在全新目录完成生产备份/禁网隔离恢复，源内容未变；不代表原始年报核对或真实watch任务已验收。
-- **S3待验收**：本人OAuth、真实数据外部核对、固定关注真实更新、常用真机与性能证据；本机恢复不等于异机灾备或正式恢复替换。运行容器不等于这些验收完成；部署状态需每次实时核对（291项离线检查与移动端测试通过）。
-
-路线图1.1重排了S1/S2/S3的含义，旧版按工程模块划分的完成描述不再用作产品验收结论。按所有者要求进入路线C的S2：先交付已阅事实对照，之后接固定关注更新，再单独评估单家公司证据约束AI试验，不预建模块。代码/自动化通过不等于本人理解性、生产登录或真机验收。
-
-快速上手：在仓库根目录执行 `make setup`、`make demo`；检查运行 `make check`，浏览器移动尺寸验证用 `make test-mobile`（需要 Playwright Chromium）。演示与浏览器测试不需要 tracker、Token 或生产数据。`output/`、`.local/`、`data/` 是本地数据，不是仓库产物，不应清理为临时文件。
+快速上手：`make setup`、`make demo`；代码检查`make check`，移动尺寸浏览器验证`make test-mobile`（需要Playwright Chromium，不代替真机）。demo/测试不依赖tracker、Token或生产数据。`output/`、`.local/`、`data/`是本地数据，不应作为临时文件清理。
