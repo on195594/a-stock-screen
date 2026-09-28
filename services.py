@@ -226,6 +226,8 @@ def _company_comparison(
     code: str,
     displayed_run_id: str | None,
     ack_run_id: str | None,
+    *,
+    snapshot_cache: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compare the exact acknowledged and displayed snapshots, never an intermediate run."""
 
@@ -235,7 +237,13 @@ def _company_comparison(
             raise ServiceError("运行不可用于事实对照")
         if run["kind"] == "peer" and run["rule_id"] != "peer-screen-v1":
             raise ServiceError("未知同业规则")
-        snap = read_verified_snapshot(state_dir, run["snapshot_path"], run["snapshot_sha256"])
+        snap = None
+        if snapshot_cache is not None:
+            snap = snapshot_cache.get(run_id)
+        if snap is None:
+            snap = read_verified_snapshot(state_dir, run["snapshot_path"], run["snapshot_sha256"])
+            if snapshot_cache is not None:
+                snapshot_cache[run_id] = snap
         rows = [r for r in safe_rows(snap) if r.get("code") == code]
         if (
             len(rows) != 1
@@ -260,6 +268,8 @@ def _company_comparison(
             "估值日": row["valuation_date"],
             "PB（倍）": row["pb"],
             "ROE三年均值（%）": row["roe_mean"],
+            "名称风险标记": row.get("risk_status"),
+            "上市状态": row.get("list_status"),
         }
         for annual in _annual_facts(row):
             year = annual["period_end"][:4]
@@ -353,6 +363,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
             str,
             tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], set[str]] | ServiceError,
         ] = {}
+        comp_cache: dict[str, dict[str, Any]] = {}
 
         def snapshot_for(
             run: dict[str, Any],
@@ -485,6 +496,12 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                         else "本次数据缺口"
                     )
                     change_summary = f"首次待阅（{gap}）"
+                elif latest_row and (
+                    latest_row.get("risk_status") == "known_warning"
+                    or latest_row.get("list_status") in ("D", "P")
+                ):
+                    change_tier = "risk_change"
+                    change_summary = "首次待阅：存在名称风险警示或非正常上市状态，请核查"
                 else:
                     change_tier = "fact_change"
                     change_summary = "首次待阅"
@@ -518,7 +535,40 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     new_val_date = latest_row.get("valuation_date") or latest_run.get(
                         "valuation_date"
                     )
-                    if _annual_facts(latest_row) != _annual_facts(ack_row):
+                    comparison = _company_comparison(
+                        conn,
+                        state_dir,
+                        code,
+                        latest_run["run_id"],
+                        ack_run_id,
+                        snapshot_cache=comp_cache,
+                    )
+                    changed_labels = {
+                        field["label"] for field in comparison["items"] if field["changed"]
+                    }
+                    real_risk_change = False
+                    if "名称风险标记" in changed_labels:
+                        old_risk = ack_row.get("risk_status")
+                        new_risk = latest_row.get("risk_status")
+                        if not (
+                            old_risk is None and new_risk == "name_check_clear_other_risks_unknown"
+                        ):
+                            real_risk_change = True
+                    if "上市状态" in changed_labels:
+                        old_list = ack_row.get("list_status")
+                        new_list = latest_row.get("list_status")
+                        if not (old_list is None and new_list == "L"):
+                            real_risk_change = True
+
+                    if not comparison["can_ack"]:
+                        has_change = True
+                        change_tier = "anomaly"
+                        change_summary = comparison["summary"]
+                    elif real_risk_change:
+                        has_change = True
+                        change_tier = "risk_change"
+                        change_summary = "公司风险标记或上市状态有变化，请核查；未知不等于风险解除"
+                    elif _annual_facts(latest_row) != _annual_facts(ack_row):
                         has_change = True
                         change_tier = "fact_change"
                         change_summary = "采用的年报数据有变化"
@@ -526,6 +576,10 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                         has_change = True
                         change_tier = "fact_change"
                         change_summary = f"PB变动: {ack_row.get('pb')} → {latest_row.get('pb')}"
+                    elif changed_labels - {"估值日"}:
+                        has_change = True
+                        change_tier = "fact_change"
+                        change_summary = "来源、范围或资料口径有变化，请查看对照"
                     elif new_val_date != old_val_date:
                         has_change = True
                         change_tier = "date_change"
@@ -546,6 +600,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     "name": it["name"],
                     "status": it["status"],
                     "reason": it["reason"],
+                    "next_check": it["next_check"],
                     "has_change": has_change,
                     "change_tier": change_tier,
                     "change_summary": change_summary,

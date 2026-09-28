@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 
+from maintenance import copy_workspace
 from workspace import (
     WorkspaceError,
     connect_workspace,
@@ -84,6 +86,23 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_copy(args: argparse.Namespace) -> int:
+    try:
+        result = copy_workspace(
+            args.source, args.destination, args.mode, restore=args.command == "restore"
+        )
+        print(
+            f"{args.command} verified: {len(result['snapshots'])} snapshots; {result['interrupted_jobs']} jobs interrupted; destination={args.destination}"
+        )
+        return 0
+    except (WorkspaceError, OSError, ValueError, sqlite3.Error) as exc:
+        print(
+            f"{args.command} failed ({type(exc).__name__}: {exc}); destination is not approved for use",
+            file=sys.stderr,
+        )
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="a-stock-screen workspace manager")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -113,6 +132,15 @@ def main() -> int:
     p_list.add_argument("--state-dir", type=Path, default=Path(".local/demo"))
     p_list.add_argument("--mode", choices=("demo", "production"), default="demo")
     p_list.set_defaults(func=cmd_list)
+
+    for command in ("backup", "restore"):
+        copy = sub.add_parser(
+            command, help="Copy to a NEW private directory; never replace live data"
+        )
+        copy.add_argument("--source", type=Path, required=True)
+        copy.add_argument("--destination", type=Path, required=True)
+        copy.add_argument("--mode", choices=("demo", "production"), required=True)
+        copy.set_defaults(func=cmd_copy)
 
     args = parser.parse_args()
     return args.func(args)

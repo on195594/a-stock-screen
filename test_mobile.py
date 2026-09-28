@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -257,13 +258,17 @@ def main() -> int:
                 time.sleep(1)
 
                 def open_notes():
-                    notes_btn = page.get_by_role("button", name="可选笔记、状态与已阅", exact=True)
+                    notes_btn = page.get_by_role(
+                        "button", name=re.compile("^(展开|收起)可选笔记、状态与已阅$")
+                    )
                     notes_btn.scroll_into_view_if_needed()
                     reason = page.locator("textarea[aria-label*='理由']").first
-                    if not reason.is_visible():
+                    if notes_btn.inner_text().startswith("展开"):
                         notes_btn.click()
+                    expect(notes_btn).to_have_text("收起可选笔记、状态与已阅")
                     reason.scroll_into_view_if_needed()
                     reason.wait_for(state="visible", timeout=10000)
+                    time.sleep(0.5)  # Flutter scroll animation must finish before pointer input.
 
                 # First review has current facts, not empty old-value arrows or expanded metadata.
                 expect(
@@ -283,6 +288,13 @@ def main() -> int:
                 reason_input = page.locator("textarea[aria-label*='理由']").first
                 reason_input.click()
                 reason_input.press_sequentially(test_reason)
+                next_step = "核查经营现金流与利润差异"
+                next_input = page.get_by_role("textbox", name="下一步核查提示", exact=False)
+                next_input.scroll_into_view_if_needed()
+                next_input.click()
+                time.sleep(0.5)  # Allow Flutter's single-line editor focus to synchronize.
+                next_input.press_sequentially(next_step, delay=40)
+                expect(next_input).to_have_value(next_step)
                 time.sleep(1)
 
                 # Dirty browser Back must show a real modal, not silently lose the edit.
@@ -293,8 +305,11 @@ def main() -> int:
                 page.get_by_role("button", name="继续编辑", exact=True).click()
                 unsaved_prompt.wait_for(state="hidden", timeout=10000)
                 expect(page).to_have_url(company_url)
+                reason_input.click()  # Flet publishes the editing value when focused.
                 expect(reason_input).to_have_value(test_reason)
                 assert reason_input.is_visible(), "Cancel did not keep the editor visible"
+                next_input.click()
+                expect(next_input).to_have_value(next_step)
 
                 # 5. Verify Save button accessibility and interactive state via semantic locator
                 save_btn = page.get_by_role("button", name="保存笔记与状态", exact=True)
@@ -318,6 +333,7 @@ def main() -> int:
                 assert row["reason"] == test_reason, (
                     f"Expected reason '{test_reason}', got '{row['reason']}'"
                 )
+                assert row["next_check"] == next_step, repr(row["next_check"])
                 assert row["revision"] >= 1, "Revision should be >= 1"
                 assert row["ack_run_id"] is None, "Saving notes must not acknowledge facts"
                 page.get_by_text("首次待阅：无已阅基准", exact=False).wait_for(state="visible")
@@ -361,6 +377,9 @@ def main() -> int:
                 )
                 time.sleep(1)
 
+                expect(
+                    page.get_by_role("group", name=f"上次下一步：{next_step}", exact=False)
+                ).to_be_visible()
                 # Pause is personal state only; hidden companies and their notes survive reload.
                 with sqlite3.connect(db_path) as conn:
                     preserved = conn.execute(
@@ -487,7 +506,7 @@ def main() -> int:
                     assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 2
                 # Real confirmation/cancellation and visible deletion feedback, not DB fallbacks.
                 page.locator("[aria-label='我的关注']").first.click()
-                expect(page.get_by_text("重要事实变动", exact=True)).to_be_visible()
+                expect(page.get_by_text("指标与资料变化", exact=True)).to_be_visible()
                 page.get_by_role("button", name="查看详情", exact=True).first.click()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
                 # S2: the comparison is visible before confirmation; opening it is read-only.
@@ -547,7 +566,7 @@ def main() -> int:
                 enable_accessibility()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
                 # This session remembers the previously opened section; following still needs no form.
-                page.get_by_role("button", name="可选笔记、状态与已阅", exact=True).click()
+                page.get_by_role("button", name="收起可选笔记、状态与已阅", exact=True).click()
                 expect(page.locator("textarea[aria-label*='理由']").first).not_to_be_visible()
                 page.get_by_role("button", name="关注", exact=True).click()
                 expect(page.get_by_role("button", name="已关注", exact=True)).to_be_disabled()

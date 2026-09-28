@@ -501,7 +501,7 @@ def test_home_verifies_each_snapshot_once_per_request(tmp_path: Path) -> None:
         )
 
 
-def test_home_uses_first_usable_ack_row_when_snapshot_has_duplicate_codes(
+def test_home_rejects_ambiguous_ack_rows_like_detail(
     tmp_path: Path,
 ) -> None:
     initialize(tmp_path, mode="demo", journal_mode="DELETE")
@@ -535,7 +535,8 @@ def test_home_uses_first_usable_ack_row_when_snapshot_has_duplicate_codes(
         )
 
     item = get_home(create_demo_actor(), tmp_path, "demo")["watch_items"][0]
-    assert item["change_summary"] == f"PB变动: {baseline_pb} → {baseline_pb + 1}"
+    assert item["change_tier"] == "anomaly"
+    assert "已阅基准异常" in item["change_summary"]
 
 
 def test_service_workflows(tmp_path: Path) -> None:
@@ -2447,6 +2448,97 @@ def test_removal_authorization_and_rollback(tmp_path, monkeypatch, operation, re
         )
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("risk_status", "known_warning"),
+        ("risk_status", "unknown"),
+        ("list_status", "D"),
+        ("list_status", "P"),
+        ("valuation_source", "tracker"),
+    ],
+)
+def test_home_and_detail_share_status_and_source_changes(tmp_path, monkeypatch, field, value):
+    from services import request_watch_update
+    from watch import build_watch_snapshot
+    from worker import run_worker
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    save_watch(actor, "600001.SH", first, {"next_check": "核查现金流证据"}, 0, tmp_path, "demo")
+    request_watch_update(actor, "first", tmp_path, "demo")
+    run_worker(tmp_path, "demo", None, once=True)
+    ctx = get_company_context(actor, "600001.SH", tmp_path, "demo")
+    mark_seen(actor, "600001.SH", ctx["displayed_run_id"], ctx["revision"], tmp_path, "demo")
+
+    def changed(*args, **kwargs):
+        snap = build_watch_snapshot(*args, **kwargs)
+        snap["rows"][0][field] = value
+        return snap
+
+    monkeypatch.setattr("worker.build_watch_snapshot", changed)
+    request_watch_update(actor, "second", tmp_path, "demo")
+    run_worker(tmp_path, "demo", None, once=True)
+    home = get_home(actor, tmp_path, "demo")["watch_items"][0]
+    assert home["has_change"]
+    assert home["change_tier"] == ("fact_change" if field == "valuation_source" else "risk_change")
+    assert home["next_check"] == "核查现金流证据"
+    ctx = get_company_context(actor, "600001.SH", tmp_path, "demo")
+    labels = {
+        "risk_status": "名称风险标记",
+        "list_status": "上市状态",
+        "valuation_source": "估值来源",
+    }
+    assert any(
+        item["label"] == labels[field] and item["changed"] for item in ctx["comparison"]["items"]
+    )
+    mark_seen(actor, "600001.SH", ctx["displayed_run_id"], ctx["revision"], tmp_path, "demo")
+    assert not get_home(actor, tmp_path, "demo")["watch_items"][0]["has_change"]
+    if value in ("known_warning", "D", "P"):
+        with connect_workspace(tmp_path, "demo") as conn:
+            conn.execute("UPDATE watch_items SET ack_run_id=NULL, ack_at=NULL")
+        assert get_home(actor, tmp_path, "demo")["watch_items"][0]["change_tier"] == "risk_change"
+
+
+def test_normal_risk_and_listing_introduction_does_not_trigger_risk_change(tmp_path):
+    from services import request_watch_update
+    from worker import run_worker
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    item = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    mark_seen(actor, "600001.SH", first, item["revision"], tmp_path, "demo")
+
+    # Watch update adds normal risk_status and list_status
+    request_watch_update(actor, "watch_update", tmp_path, "demo")
+    run_worker(tmp_path, "demo", None, once=True)
+
+    home = get_home(actor, tmp_path, "demo")["watch_items"][0]
+    # Should NOT be classified as risk_change
+    assert home["change_tier"] != "risk_change"
+
+
+def test_home_date_only_refresh_is_neutral(tmp_path):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    fixture = FIXTURES_DIR / "peer_complete_v1.json"
+    first = import_snapshot(tmp_path, fixture, "demo")
+    saved = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    mark_seen(actor, "600001.SH", first, saved["revision"], tmp_path, "demo")
+    snap = json.loads(fixture.read_text())
+    snap["data_date"] = "2026-09-21"
+    snap["screened_at"] = "2026-09-21T16:00:00+08:00"
+    snap["generated_at"] = snap["screened_at"]
+    for row in snap["rows"]:
+        row["valuation_date"] = "2026-09-21"
+    path = tmp_path / "date_only.json"
+    path.write_text(json.dumps(snap))
+    import_snapshot(tmp_path, path, "demo")
+    assert get_home(actor, tmp_path, "demo")["watch_items"][0]["change_tier"] == "date_change"
+
+
 def test_home_change_tier_classification(tmp_path: Path) -> None:
     initialize(tmp_path, "demo", journal_mode="DELETE")
     actor = create_demo_actor()
@@ -2473,8 +2565,9 @@ def test_home_change_tier_classification(tmp_path: Path) -> None:
     items_by_code = {it["code"]: it for it in home["watch_items"]}
     assert items_by_code["600001.SH"]["change_tier"] == "fact_change"
     assert items_by_code["600001.SH"]["change_summary"] == "采用的年报数据有变化"
-    assert items_by_code["600002.SH"]["change_tier"] == "date_change"
-    assert "估值日期变动" in items_by_code["600002.SH"]["change_summary"]
+    # This partial fixture also changes scope/completeness; it is not date-only.
+    assert items_by_code["600002.SH"]["change_tier"] == "fact_change"
+    assert "口径有变化" in items_by_code["600002.SH"]["change_summary"]
     assert items_by_code["600003.SH"]["change_tier"] == "anomaly"
     assert "本次财务更新失败" in items_by_code["600003.SH"]["change_summary"]
     assert items_by_code["600004.SH"]["change_tier"] == "fact_change"

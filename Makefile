@@ -16,13 +16,13 @@ demo:
 
 check:
 	@echo "==> Running pytest checks..."
-	@$(PYTHON) -m pytest test_screen.py test_workspace.py test_services.py test_app.py test_worker.py test_deploy.py -q -o cache_dir=/tmp/.pytest_cache
+	@$(PYTHON) -m pytest test_screen.py test_workspace.py test_services.py test_app.py test_worker.py test_deploy.py test_maintenance.py -q -o cache_dir=/tmp/.pytest_cache
 	@echo "==> Running ruff format checks..."
 	@$(PYTHON) -m ruff format --check --cache-dir /tmp/.ruff_cache .
 	@echo "==> Running ruff checks..."
 	@$(PYTHON) -m ruff check --cache-dir /tmp/.ruff_cache .
 	@echo "==> Running mypy checks..."
-	@$(PYTHON) -m mypy --cache-dir /tmp/.mypy_cache workspace.py auth.py screen.py services.py watch.py worker.py app.py
+	@$(PYTHON) -m mypy --cache-dir /tmp/.mypy_cache workspace.py auth.py screen.py services.py watch.py worker.py app.py maintenance.py manage.py
 
 test-mobile:
 	@echo "==> Running mobile end-to-end browser test..."

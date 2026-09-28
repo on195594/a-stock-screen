@@ -416,10 +416,17 @@ def build_app():
 
             update_button.on_click = submit_watch
             last_group = None
-            tier_order = {"anomaly": 0, "fact_change": 1, "date_change": 2, "no_change": 3}
+            tier_order = {
+                "anomaly": 0,
+                "risk_change": 1,
+                "fact_change": 2,
+                "date_change": 3,
+                "no_change": 4,
+            }
             tier_titles = {
                 "anomaly": "数据异常与缺口",
-                "fact_change": "重要事实变动",
+                "risk_change": "公司状态变化（请核查）",
+                "fact_change": "指标与资料变化",
                 "date_change": "仅数据日更新",
                 "no_change": "暂无未阅变化",
             }
@@ -427,7 +434,7 @@ def build_app():
             for it in sorted(
                 data["watch_items"],
                 key=lambda item: (
-                    tier_order.get(item.get("change_tier", "no_change"), 3),
+                    tier_order.get(item.get("change_tier", "no_change"), 4),
                     item["status"] != "research",
                     item["code"],
                 ),
@@ -513,7 +520,7 @@ def build_app():
                     destination = items_controls
                     group = tier_titles.get(tier, "暂无未阅变化")
                     if group != last_group:
-                        if tier == "anomaly":
+                        if tier in ("anomaly", "risk_change"):
                             header: ft.Control = ft.Row(
                                 controls=[
                                     ft.Icon(
@@ -555,7 +562,7 @@ def build_app():
                 change_desc = it["change_summary"] if it["has_change"] else "覆盖字段暂无未阅变化"
                 desc_color = (
                     ft.Colors.RED_900
-                    if tier == "anomaly"
+                    if tier in ("anomaly", "risk_change")
                     else (
                         ft.Colors.ORANGE_900
                         if tier == "fact_change"
@@ -566,7 +573,7 @@ def build_app():
                 )
                 desc_weight = (
                     ft.FontWeight.BOLD
-                    if tier in ("anomaly", "fact_change")
+                    if tier in ("anomaly", "risk_change", "fact_change")
                     else ft.FontWeight.NORMAL
                 )
                 destination.append(
@@ -597,6 +604,18 @@ def build_app():
                                     ),
                                     ft.Text(it.get("fact_summary", "暂无可用事实"), size=14),
                                     ft.Text(it.get("roe_trend", ""), size=13),
+                                    *(
+                                        [
+                                            ft.Text(
+                                                f"上次下一步：{it['next_check']}",
+                                                size=13,
+                                                max_lines=2,
+                                                overflow=ft.TextOverflow.ELLIPSIS,
+                                            )
+                                        ]
+                                        if it.get("next_check")
+                                        else []
+                                    ),
                                     ft.Text(
                                         f"数据日：{it.get('valuation_date', '暂无')}",
                                         size=13,
@@ -1642,6 +1661,14 @@ def build_app():
             comparison_summary = ft.Text(comparison["summary"], weight=ft.FontWeight.BOLD)
 
             def comparison_value(value, label, current):
+                if label == "名称风险标记" and value:
+                    return {
+                        "known_warning": "名称含风险警示",
+                        "unknown": "未知（不代表风险解除）",
+                        "name_check_clear_other_risks_unknown": "未识别到名称风险警示（不代表无风险）",
+                    }.get(value, str(value))
+                if label == "上市状态" and value:
+                    return {"L": "上市", "D": "退市", "P": "暂停上市"}.get(value, str(value))
                 if value is None or value == "":
                     if (
                         current
@@ -1817,6 +1844,9 @@ def build_app():
                 ):
                     return
                 notes_expanded = not notes_expanded
+                notes_button.content = (
+                    "收起" if notes_expanded else "展开"
+                ) + "可选笔记、状态与已阅"
                 page_state["expanded_sections"][notes_key] = notes_expanded
                 for control in form_controls[1:]:
                     control.visible = notes_expanded and (
@@ -1824,9 +1854,11 @@ def build_app():
                     )
                 page.update()
 
-            form_controls: list[ft.Control] = [
-                ft.Button("可选笔记、状态与已阅", on_click=toggle_notes),
-            ]
+            notes_button = ft.Button(
+                ("收起" if notes_expanded else "展开") + "可选笔记、状态与已阅",
+                on_click=toggle_notes,
+            )
+            form_controls: list[ft.Control] = [notes_button]
             if conflict_detected:
                 conflict_banner = ft.Container(
                     content=ft.Column(
@@ -2031,6 +2063,17 @@ def build_app():
                                     ),
                                     follow_btn,
                                     follow_feedback,
+                                    *(
+                                        [
+                                            ft.Text(
+                                                f"上次下一步：{ctx['next_check']}",
+                                                size=14,
+                                                weight=ft.FontWeight.BOLD,
+                                            )
+                                        ]
+                                        if ctx.get("next_check")
+                                        else []
+                                    ),
                                     ft.Text(
                                         "上次已阅 → 当前资料"
                                         if ctx.get("ack_run_id")

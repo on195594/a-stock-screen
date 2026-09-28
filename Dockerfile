@@ -15,7 +15,7 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy application source code
-COPY app.py auth.py services.py workspace.py screen.py manage.py watch.py worker.py ./
+COPY app.py auth.py services.py workspace.py screen.py manage.py watch.py worker.py maintenance.py ./
 COPY tests/fixtures ./tests/fixtures
 COPY assets ./assets
 COPY docker/entrypoint.sh /entrypoint.sh

@@ -1251,7 +1251,7 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
         await page.on_route_change(SimpleNamespace(route="/company/600002.SH"))
         reason = next(c for c in controls() if isinstance(c, ft.TextField) and "理由" in c.label)
         assert not reason.visible  # Merely following does not open a manual form.
-        await button("可选笔记、状态与已阅").on_click(None)
+        await button("展开可选笔记、状态与已阅").on_click(None)
         assert reason.visible
         reason.value = "未保存草稿"
         await page.on_route_change(SimpleNamespace(route=discover_route))
@@ -1283,7 +1283,7 @@ def test_discover_join_context_navigation_and_unsaved_guard(tmp_path, monkeypatc
         # The new detail-page follow/toggle callbacks must also expire on navigation.
         await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
         stale_follow = button("关注")
-        stale_toggle = button("可选笔记、状态与已阅")
+        stale_toggle = button("展开可选笔记、状态与已阅")
         await page.on_route_change(SimpleNamespace(route="/"))
         await stale_follow.on_click(None)
         await stale_toggle.on_click(None)
@@ -1382,7 +1382,7 @@ def test_removal_dialog_cancel_conflict_navigation_and_readd(tmp_path, monkeypat
             )
 
         await page.on_route_change(SimpleNamespace(route="/company/600001.SH"))
-        await button("可选笔记、状态与已阅").on_click(None)
+        await button("展开可选笔记、状态与已阅").on_click(None)
         delete = button("删除个人研究记录")
         await delete.on_click(None)
         cancelled_confirm = page.dialog.actions[1]
@@ -1551,9 +1551,19 @@ def test_home_tiered_grouping_and_styling(tmp_path, monkeypatch):
         "get_home",
         lambda *args: {
             "valuation_date": "2026-09-21",
-            "needs_review_count": 4,
-            "total_watch_count": 5,
+            "needs_review_count": 5,
+            "total_watch_count": 6,
             "watch_items": [
+                {
+                    "code": "600006.SH",
+                    "name": "标的己",
+                    "status": "observe",
+                    "has_change": True,
+                    "change_tier": "risk_change",
+                    "reason": "",
+                    "change_summary": "公司上市状态变化，请核查",
+                    "valuation_date": "2026-09-21",
+                },
                 {
                     "code": "600004.SH",
                     "name": "标的丁",
@@ -1616,32 +1626,47 @@ def test_home_tiered_grouping_and_styling(tmp_path, monkeypatch):
         for c in home.controls:
             if isinstance(c, ft.Text) and c.value in (
                 "数据异常与缺口",
-                "重要事实变动",
+                "公司状态变化（请核查）",
+                "指标与资料变化",
                 "仅数据日更新",
                 "暂无未阅变化",
             ):
                 header_texts.append(c.value)
             elif isinstance(c, ft.Row) and c.controls and isinstance(c.controls[-1], ft.Text):
                 val = c.controls[-1].value
-                if val in ("数据异常与缺口", "重要事实变动", "仅数据日更新", "暂无未阅变化"):
+                if val in (
+                    "数据异常与缺口",
+                    "公司状态变化（请核查）",
+                    "指标与资料变化",
+                    "仅数据日更新",
+                    "暂无未阅变化",
+                ):
                     header_texts.append(val)
-        assert header_texts == ["数据异常与缺口", "重要事实变动", "仅数据日更新", "暂无未阅变化"]
+        assert header_texts == [
+            "数据异常与缺口",
+            "公司状态变化（请核查）",
+            "指标与资料变化",
+            "仅数据日更新",
+            "暂无未阅变化",
+        ]
 
         cards = [c for c in home.controls if isinstance(c, ft.Card)]
-        assert len(cards) == 4  # 4 active cards; 1 paused is in paused_controls column
+        assert len(cards) == 5  # Paused company remains outside the active groups.
         card_titles = []
         for card in cards:
             for text_c in app_controls(card):
                 if isinstance(text_c, ft.Text) and ("标的" in (text_c.value or "")):
                     card_titles.append(text_c.value.split()[0])
                     break
-        assert card_titles == ["标的甲", "标的乙", "标的丙", "标的丁"]
+        assert card_titles == ["标的甲", "标的己", "标的乙", "标的丙", "标的丁"]
 
         # Check styling of change descriptions
         for card in cards:
             for text_c in app_controls(card):
                 if isinstance(text_c, ft.Text):
-                    if "估值日倒退" in (text_c.value or ""):
+                    if "估值日倒退" in (text_c.value or "") or "上市状态变化" in (
+                        text_c.value or ""
+                    ):
                         assert (
                             text_c.color == ft.Colors.RED_900
                             and text_c.weight == ft.FontWeight.BOLD
