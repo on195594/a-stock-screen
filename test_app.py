@@ -1437,3 +1437,123 @@ def test_removal_dialog_cancel_conflict_navigation_and_readd(tmp_path, monkeypat
             assert get_watch_item(conn, "600001.SH") is not None
 
     asyncio.run(check())
+
+
+def test_home_tiered_grouping_and_styling(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(
+        app,
+        "get_home",
+        lambda *args: {
+            "valuation_date": "2026-09-21",
+            "needs_review_count": 4,
+            "total_watch_count": 5,
+            "watch_items": [
+                {
+                    "code": "600004.SH",
+                    "name": "标的丁",
+                    "status": "observe",
+                    "reason": "",
+                    "has_change": False,
+                    "change_tier": "no_change",
+                    "change_summary": "本工具覆盖的字段暂无未阅变化",
+                    "valuation_date": "2026-09-20",
+                },
+                {
+                    "code": "600002.SH",
+                    "name": "标的乙",
+                    "status": "research",
+                    "reason": "",
+                    "has_change": True,
+                    "change_tier": "fact_change",
+                    "change_summary": "PB变动: 1.85 → 1.8",
+                    "valuation_date": "2026-09-21",
+                },
+                {
+                    "code": "600001.SH",
+                    "name": "标的甲",
+                    "status": "observe",
+                    "reason": "",
+                    "has_change": True,
+                    "change_tier": "anomaly",
+                    "change_summary": "最新运行估值日倒退异常，仍展示上次可用资料",
+                    "valuation_date": "2026-09-20",
+                },
+                {
+                    "code": "600003.SH",
+                    "name": "标的丙",
+                    "status": "observe",
+                    "reason": "",
+                    "has_change": True,
+                    "change_tier": "date_change",
+                    "change_summary": "估值日期变动: 2026-09-20 → 2026-09-21",
+                    "valuation_date": "2026-09-21",
+                },
+                {
+                    "code": "600005.SH",
+                    "name": "标的戊",
+                    "status": "paused",
+                    "reason": "",
+                    "has_change": True,
+                    "change_tier": "fact_change",
+                    "change_summary": "PB变动",
+                    "valuation_date": "2026-09-21",
+                },
+            ],
+        },
+    )
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+        home = page.controls[0].controls[0].controls[0].content.controls[1].content
+        header_texts = []
+        for c in home.controls:
+            if isinstance(c, ft.Text) and c.value in (
+                "数据异常与缺口",
+                "重要事实变动",
+                "仅数据日更新",
+                "暂无未阅变化",
+            ):
+                header_texts.append(c.value)
+            elif isinstance(c, ft.Row) and c.controls and isinstance(c.controls[-1], ft.Text):
+                val = c.controls[-1].value
+                if val in ("数据异常与缺口", "重要事实变动", "仅数据日更新", "暂无未阅变化"):
+                    header_texts.append(val)
+        assert header_texts == ["数据异常与缺口", "重要事实变动", "仅数据日更新", "暂无未阅变化"]
+
+        cards = [c for c in home.controls if isinstance(c, ft.Card)]
+        assert len(cards) == 4  # 4 active cards; 1 paused is in paused_controls column
+        card_titles = []
+        for card in cards:
+            for text_c in app_controls(card):
+                if isinstance(text_c, ft.Text) and ("标的" in (text_c.value or "")):
+                    card_titles.append(text_c.value.split()[0])
+                    break
+        assert card_titles == ["标的甲", "标的乙", "标的丙", "标的丁"]
+
+        # Check styling of change descriptions
+        for card in cards:
+            for text_c in app_controls(card):
+                if isinstance(text_c, ft.Text):
+                    if "估值日倒退" in (text_c.value or ""):
+                        assert (
+                            text_c.color == ft.Colors.RED_900
+                            and text_c.weight == ft.FontWeight.BOLD
+                        )
+                    elif "PB变动" in (text_c.value or ""):
+                        assert (
+                            text_c.color == ft.Colors.ORANGE_900
+                            and text_c.weight == ft.FontWeight.BOLD
+                        )
+                    elif "估值日期变动" in (text_c.value or ""):
+                        assert (
+                            text_c.color == ft.Colors.BLUE_GREY_700
+                            and text_c.weight == ft.FontWeight.NORMAL
+                        )
+                    elif "暂无未阅变化" in (text_c.value or ""):
+                        assert text_c.color == ft.Colors.GREY_700
+
+    asyncio.run(check())

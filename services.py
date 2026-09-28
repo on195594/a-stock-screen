@@ -446,11 +446,13 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
             item_date = (usable_run["valuation_date"] if usable_run else latest_date) or "暂无"
             change_summary = ""
             has_change = False
+            change_tier = "no_change"
 
             if latest_corrupt_index is not None and (
                 latest_index is None or latest_corrupt_index < latest_index
             ):
                 has_change = True
+                change_tier = "anomaly"
                 change_summary = (
                     "最新快照文件损坏或无法读取，仍展示上次可用资料"
                     if usable_run
@@ -460,6 +462,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                 conn, code, latest_run["captured_at"] if latest_run else None
             ):
                 has_change = True
+                change_tier = "anomaly"
                 change_summary = (
                     "最近固定关注更新未完成，仍展示上次可用资料；请查看最近更新"
                     if usable_run
@@ -467,12 +470,15 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                 )
             elif regression:
                 has_change = True
+                change_tier = "anomaly"
                 change_summary = "最新运行估值日倒退异常，仍展示上次可用资料"
             elif not ack_run_id:
                 has_change = True
                 if latest_run and latest_row is None:
+                    change_tier = "anomaly"
                     change_summary = "首次待阅（最新运行覆盖该标的但缺少事实数据：数据缺口）"
                 elif latest_row and not is_row_usable(latest_row):
+                    change_tier = "anomaly"
                     gap = (
                         "本次财务更新失败"
                         if latest_row.get("financial_status") == "failed"
@@ -480,6 +486,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     )
                     change_summary = f"首次待阅（{gap}）"
                 else:
+                    change_tier = "fact_change"
                     change_summary = "首次待阅"
             elif latest_run and latest_run["run_id"] != ack_run_id:
                 ack_row = None
@@ -490,14 +497,17 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
 
                 if latest_row is None:
                     has_change = True
+                    change_tier = "anomaly"
                     change_summary = (
                         "最新运行覆盖该标的但缺少事实数据（数据缺口），仍展示上次可用资料"
                     )
                 elif ack_row is None:
                     has_change = True
+                    change_tier = "anomaly"
                     change_summary = "已阅基准文件异常，无法比对变化"
                 elif not is_row_usable(latest_row):
                     has_change = True
+                    change_tier = "anomaly"
                     change_summary = (
                         "本次财务更新失败，仍展示上次资料"
                         if latest_row.get("financial_status") == "failed"
@@ -510,16 +520,21 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     )
                     if _annual_facts(latest_row) != _annual_facts(ack_row):
                         has_change = True
+                        change_tier = "fact_change"
                         change_summary = "采用的年报数据有变化"
                     elif latest_row.get("pb") != ack_row.get("pb"):
                         has_change = True
+                        change_tier = "fact_change"
                         change_summary = f"PB变动: {ack_row.get('pb')} → {latest_row.get('pb')}"
                     elif new_val_date != old_val_date:
                         has_change = True
+                        change_tier = "date_change"
                         change_summary = f"估值日期变动: {old_val_date} → {new_val_date}"
                     else:
+                        change_tier = "no_change"
                         change_summary = "本工具覆盖的字段暂无未阅变化"
                 else:
+                    change_tier = "no_change"
                     change_summary = "本工具覆盖的字段暂无未阅变化"
 
             if has_change and it["status"] != "paused":
@@ -532,6 +547,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     "status": it["status"],
                     "reason": it["reason"],
                     "has_change": has_change,
+                    "change_tier": change_tier,
                     "change_summary": change_summary,
                     "revision": it["revision"],
                     "updated_at": it["updated_at"],

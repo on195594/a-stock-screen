@@ -416,11 +416,18 @@ def build_app():
 
             update_button.on_click = submit_watch
             last_group = None
+            tier_order = {"anomaly": 0, "fact_change": 1, "date_change": 2, "no_change": 3}
+            tier_titles = {
+                "anomaly": "数据异常与缺口",
+                "fact_change": "重要事实变动",
+                "date_change": "仅数据日更新",
+                "no_change": "暂无未阅变化",
+            }
 
             for it in sorted(
                 data["watch_items"],
                 key=lambda item: (
-                    not item["has_change"],
+                    tier_order.get(item.get("change_tier", "no_change"), 3),
                     item["status"] != "research",
                     item["code"],
                 ),
@@ -499,15 +506,69 @@ def build_app():
                             e.control.disabled = False
                             page.update()
 
+                tier = it.get("change_tier", "no_change")
                 if it["status"] == "paused":
                     destination = paused_controls
                 else:
                     destination = items_controls
-                    group = "需要复看" if it["has_change"] else "暂无未阅变化"
+                    group = tier_titles.get(tier, "暂无未阅变化")
                     if group != last_group:
-                        items_controls.append(ft.Text(group, size=16, weight=ft.FontWeight.BOLD))
+                        if tier == "anomaly":
+                            header: ft.Control = ft.Row(
+                                controls=[
+                                    ft.Icon(
+                                        ft.Icons.WARNING_AMBER_ROUNDED,
+                                        color=ft.Colors.RED_900,
+                                        size=18,
+                                    ),
+                                    ft.Text(
+                                        group,
+                                        size=16,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=ft.Colors.RED_900,
+                                    ),
+                                ],
+                                spacing=4,
+                            )
+                        elif tier == "fact_change":
+                            header = ft.Text(
+                                group,
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
+                                color=ft.Colors.ORANGE_900,
+                            )
+                        elif tier == "date_change":
+                            header = ft.Text(
+                                group,
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
+                                color=ft.Colors.BLUE_GREY_800,
+                            )
+                        else:
+                            header = ft.Text(
+                                group,
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
+                            )
+                        items_controls.append(header)
                         last_group = group
                 change_desc = it["change_summary"] if it["has_change"] else "覆盖字段暂无未阅变化"
+                desc_color = (
+                    ft.Colors.RED_900
+                    if tier == "anomaly"
+                    else (
+                        ft.Colors.ORANGE_900
+                        if tier == "fact_change"
+                        else (
+                            ft.Colors.BLUE_GREY_700 if tier == "date_change" else ft.Colors.GREY_700
+                        )
+                    )
+                )
+                desc_weight = (
+                    ft.FontWeight.BOLD
+                    if tier in ("anomaly", "fact_change")
+                    else ft.FontWeight.NORMAL
+                )
                 destination.append(
                     ft.Card(
                         semantic_container=False,
@@ -531,9 +592,8 @@ def build_app():
                                     ft.Text(
                                         change_desc,
                                         size=13,
-                                        color=ft.Colors.ORANGE_800
-                                        if it["has_change"]
-                                        else ft.Colors.GREY_700,
+                                        color=desc_color,
+                                        weight=desc_weight,
                                     ),
                                     ft.Text(it.get("fact_summary", "暂无可用事实"), size=14),
                                     ft.Text(it.get("roe_trend", ""), size=13),

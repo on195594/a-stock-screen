@@ -257,9 +257,12 @@ def main() -> int:
                 time.sleep(1)
 
                 def open_notes():
+                    notes_btn = page.get_by_role("button", name="可选笔记、状态与已阅", exact=True)
+                    notes_btn.scroll_into_view_if_needed()
                     reason = page.locator("textarea[aria-label*='理由']").first
                     if not reason.is_visible():
-                        page.get_by_role("button", name="可选笔记、状态与已阅", exact=True).click()
+                        notes_btn.click()
+                    reason.scroll_into_view_if_needed()
                     reason.wait_for(state="visible", timeout=10000)
 
                 # Following is complete without a form; old notes are optional and preserved.
@@ -474,6 +477,7 @@ def main() -> int:
                     assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 2
                 # Real confirmation/cancellation and visible deletion feedback, not DB fallbacks.
                 page.locator("[aria-label='我的关注']").first.click()
+                expect(page.get_by_text("重要事实变动", exact=True)).to_be_visible()
                 page.get_by_role("button", name="查看详情", exact=True).first.click()
                 page.wait_for_selector("text=公司筛选事实", timeout=10000)
                 # S2: the comparison is visible before confirmation; opening it is read-only.

@@ -2445,3 +2445,49 @@ def test_removal_authorization_and_rollback(tmp_path, monkeypatch, operation, re
             ).fetchone()[0]
             != "dismissed"
         )
+
+
+def test_home_change_tier_classification(tmp_path: Path) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    # 600001: will have annual ROE change in second fixture -> fact_change
+    item1 = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    mark_seen(actor, "600001.SH", first, item1["revision"], tmp_path, "demo")
+    # 600002: PB change from 1.15 to 1.18 in second fixture -> fact_change
+    item2 = save_watch(actor, "600002.SH", first, {}, 0, tmp_path, "demo")
+    mark_seen(actor, "600002.SH", first, item2["revision"], tmp_path, "demo")
+    # 600003: first-time review with financial gap in v2 -> anomaly
+    save_watch(actor, "600003.SH", first, {}, 0, tmp_path, "demo")
+    # 600004: first-time review with healthy usable facts in v1 -> fact_change
+    save_watch(actor, "600004.SH", first, {}, 0, tmp_path, "demo")
+
+    # Import second fixture (2026-09-21) where 600002 keeps PB=1.15 to test pure date_change
+    v2_data = json.loads((FIXTURES_DIR / "peer_second_change.json").read_text())
+    v2_data["rows"][1]["pb"] = 1.15
+    v2_file = tmp_path / "v2_test.json"
+    v2_file.write_text(json.dumps(v2_data))
+    import_snapshot(tmp_path, v2_file, "demo")
+
+    home = get_home(actor, tmp_path, "demo")
+    items_by_code = {it["code"]: it for it in home["watch_items"]}
+    assert items_by_code["600001.SH"]["change_tier"] == "fact_change"
+    assert items_by_code["600001.SH"]["change_summary"] == "采用的年报数据有变化"
+    assert items_by_code["600002.SH"]["change_tier"] == "date_change"
+    assert "估值日期变动" in items_by_code["600002.SH"]["change_summary"]
+    assert items_by_code["600003.SH"]["change_tier"] == "anomaly"
+    assert "本次财务更新失败" in items_by_code["600003.SH"]["change_summary"]
+    assert items_by_code["600004.SH"]["change_tier"] == "fact_change"
+    assert items_by_code["600004.SH"]["change_summary"] == "首次待阅"
+
+    # Simulate a failed watch job for 600002.SH -> anomaly
+    with connect_workspace(tmp_path, "demo") as conn:
+        conn.execute(
+            """INSERT INTO update_jobs (job_id, request_id, kind, payload_json, dedupe_key, status, phase, requested_at, updated_at, finished_at)
+            VALUES ('job_err', 'req_err', 'watch', json(?), 'key_err', 'failed', 'failed', '2026-09-22T00:00:00+00:00', '2026-09-22T00:00:01+00:00', '2026-09-22T00:00:01+00:00')""",
+            (json.dumps({"codes": ["600002.SH"], "target_date": "2026-09-21"}),),
+        )
+    home_err = get_home(actor, tmp_path, "demo")
+    items_err = {it["code"]: it for it in home_err["watch_items"]}
+    assert items_err["600002.SH"]["change_tier"] == "anomaly"
+    assert "最近固定关注更新未完成" in items_err["600002.SH"]["change_summary"]
