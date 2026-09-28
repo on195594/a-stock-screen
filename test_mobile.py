@@ -348,6 +348,47 @@ def main() -> int:
                 )
                 time.sleep(1)
 
+                # Pause is personal state only; hidden companies and their notes survive reload.
+                with sqlite3.connect(db_path) as conn:
+                    preserved = conn.execute(
+                        "SELECT reason,next_check,note_url,added_run_id,ack_run_id,ack_at FROM watch_items WHERE code='600001.SH'"
+                    ).fetchone()
+                page.get_by_role("button", name="暂停关注", exact=True).click()
+                page.get_by_text(
+                    "已暂停关注，不再计入需要复看；笔记和已阅基准保留。", exact=True
+                ).wait_for(state="visible")
+                expect(page.get_by_role("button", name="查看详情", exact=True)).to_have_count(0)
+                page.reload()
+                page.wait_for_load_state("domcontentloaded")
+                enable_accessibility()
+                expect(page.get_by_role("button", name="查看详情", exact=True)).to_have_count(0)
+                page.get_by_role("button", name="显示已暂停 (1)", exact=True).click()
+                resume = page.get_by_role("button", name="恢复为观察", exact=True)
+                for width in (360, 390, 430):
+                    page.set_viewport_size({"width": width, "height": 844})
+                    resume.scroll_into_view_if_needed()
+                    expect(resume).to_be_visible()
+                    bounds = resume.bounding_box()
+                    assert (
+                        bounds and bounds["x"] >= 0 and bounds["x"] + bounds["width"] <= width + 1
+                    )
+                page.set_viewport_size({"width": 390, "height": 844})
+                resume.click()
+                page.get_by_text("已恢复为观察，笔记和已阅基准保留。", exact=True).wait_for(
+                    state="visible"
+                )
+                with sqlite3.connect(db_path) as conn:
+                    assert (
+                        conn.execute(
+                            "SELECT reason,next_check,note_url,added_run_id,ack_run_id,ack_at FROM watch_items WHERE code='600001.SH'"
+                        ).fetchone()
+                        == preserved
+                    )
+                    assert conn.execute(
+                        "SELECT status FROM watch_items WHERE code='600001.SH'"
+                    ).fetchone() == ("observe",)
+                    assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 1
+
                 # 9. Re-enter detail page to verify persisted reason in the detail view
                 detail_btn = page.locator("flt-semantics[role='button']:has-text('查看详情')").first
                 if detail_btn.is_visible():
@@ -496,7 +537,7 @@ def main() -> int:
                 # Flet may attempt optional CDN resources; every external request was aborted.
                 print(f"External requests blocked (none allowed): {sorted(set(blocked_requests))}")
                 print(
-                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload."
+                    "Mobile browser test passed (360/390/430px, synthetic, not a real device): empty -> submit -> worker -> comparison -> add -> dirty Back/cancel -> visible save feedback -> back -> reload -> pause/reload/resume -> partial/old board -> acknowledged/current comparison -> explicit ack -> delete/cancel/re-add -> dismiss failure/reload."
                 )
                 return 0
             except Exception as exc:

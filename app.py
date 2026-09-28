@@ -31,6 +31,7 @@ from services import (
     peer_anchors,
     request_peer_update,
     save_watch,
+    set_watch_status,
 )
 from workspace import WorkspaceError
 
@@ -365,8 +366,18 @@ def build_app():
             if gen != page_state["generation"] or not actor.is_valid:
                 return await render_login()
             items_controls: list[ft.Control] = []
+            paused_controls: list[ft.Control] = []
+            status_feedback = ft.Text("", color=ft.Colors.RED_700)
+            last_group = None
 
-            for it in data["watch_items"]:
+            for it in sorted(
+                data["watch_items"],
+                key=lambda item: (
+                    not item["has_change"],
+                    item["status"] != "research",
+                    item["code"],
+                ),
+            ):
                 code = it["code"]
                 status_color = (
                     ft.Colors.BLUE_700
@@ -389,11 +400,70 @@ def build_app():
                 )
 
                 async def on_card_click(e, c=code):
-                    await navigate(f"/company/{c}")
+                    if (
+                        gen == page_state["generation"]
+                        and actor.is_valid
+                        and page_state["connected"]
+                    ):
+                        await navigate(f"/company/{c}")
 
+                async def change_status(e, item=it):
+                    if (
+                        gen != page_state["generation"]
+                        or not actor.is_valid
+                        or not page_state["connected"]
+                        or e.control.disabled
+                    ):
+                        return
+                    e.control.disabled = True
+                    page.update()
+                    target = "observe" if item["status"] == "paused" else "paused"
+                    try:
+                        await asyncio.to_thread(
+                            set_watch_status,
+                            actor,
+                            item["code"],
+                            target,
+                            item["revision"],
+                            item["updated_at"],
+                            STATE_DIR,
+                            APP_MODE,
+                        )
+                        if (
+                            gen == page_state["generation"]
+                            and actor.is_valid
+                            and page_state["connected"]
+                        ):
+                            page_state["notice"] = (
+                                "已恢复为观察，笔记和已阅基准保留。"
+                                if target == "observe"
+                                else "已暂停关注，不再计入需要复看；笔记和已阅基准保留。"
+                            )
+                            await navigate("/")
+                    except Exception:
+                        if (
+                            gen == page_state["generation"]
+                            and actor.is_valid
+                            and page_state["connected"]
+                        ):
+                            status_feedback.value = (
+                                "状态修改未确认，记录可能已变化；请重新打开首页核对，不会自动重试。"
+                            )
+                            e.control.disabled = False
+                            page.update()
+
+                if it["status"] == "paused":
+                    destination = paused_controls
+                else:
+                    destination = items_controls
+                    group = "需要复看" if it["has_change"] else "暂无未阅变化"
+                    if group != last_group:
+                        items_controls.append(ft.Text(group, size=16, weight=ft.FontWeight.BOLD))
+                        last_group = group
                 change_desc = it["change_summary"] if it["has_change"] else "覆盖字段暂无未阅变化"
-                items_controls.append(
+                destination.append(
                     ft.Card(
+                        semantic_container=False,
                         content=ft.Container(
                             padding=12,
                             on_click=on_card_click,
@@ -403,6 +473,7 @@ def build_app():
                                         controls=[
                                             ft.Text(
                                                 f"{it['name']} ({code})",
+                                                expand=True,
                                                 size=16,
                                                 weight=ft.FontWeight.BOLD,
                                             ),
@@ -419,26 +490,34 @@ def build_app():
                                     ),
                                     ft.Text(it.get("fact_summary", "暂无可用事实"), size=14),
                                     ft.Text(it.get("roe_trend", ""), size=13),
+                                    ft.Text(
+                                        f"数据日：{it.get('valuation_date', '暂无')}",
+                                        size=13,
+                                        color=ft.Colors.BLACK_87,
+                                    ),
                                     ft.Row(
                                         controls=[
-                                            ft.Text(
-                                                f"数据日：{it.get('valuation_date', '暂无')}",
-                                                size=13,
-                                                color=ft.Colors.BLACK_87,
-                                                expand=True,
-                                            ),
                                             ft.Button("查看详情", on_click=on_card_click),
+                                            ft.Button(
+                                                "恢复为观察"
+                                                if it["status"] == "paused"
+                                                else "暂停关注",
+                                                on_click=change_status,
+                                            ),
                                         ],
-                                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                        wrap=True,
                                     ),
                                 ],
                                 spacing=4,
                             ),
-                        )
+                        ),
                     )
                 )
 
-            if not items_controls:
+            if paused_controls and not items_controls:
+                items_controls.append(ft.Text("当前关注均已暂停；展开下方列表可恢复为观察。"))
+
+            if not data["watch_items"]:
 
                 async def go_to_discover(e):
                     if (
@@ -475,6 +554,29 @@ def build_app():
                     )
                 )
 
+            paused_key = ("/", "paused_watch")
+            paused_body = ft.Column(
+                paused_controls, visible=page_state["expanded_sections"].get(paused_key, False)
+            )
+            paused_button = ft.Button(
+                f"{'收起' if paused_body.visible else '显示'}已暂停 ({len(paused_controls)})"
+            )
+
+            async def toggle_paused(e):
+                if (
+                    gen != page_state["generation"]
+                    or not actor.is_valid
+                    or not page_state["connected"]
+                ):
+                    return
+                paused_body.visible = not paused_body.visible
+                page_state["expanded_sections"][paused_key] = paused_body.visible
+                paused_button.content = (
+                    f"{'收起' if paused_body.visible else '显示'}已暂停 ({len(paused_controls)})"
+                )
+                page.update()
+
+            paused_button.on_click = toggle_paused
             job_controls: list[ft.Control] = []
             for job in jobs:
 
@@ -527,7 +629,9 @@ def build_app():
                         size=15,
                         weight=ft.FontWeight.W_600,
                     ),
+                    status_feedback,
                     *items_controls,
+                    *([paused_button, paused_body] if paused_controls else []),
                     *(
                         [ft.Text("最近同业更新", weight=ft.FontWeight.BOLD)] + job_controls
                         if job_controls

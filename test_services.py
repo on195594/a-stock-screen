@@ -26,6 +26,7 @@ from services import (
     request_peer_update,
     roe_trend,
     save_watch,
+    set_watch_status,
 )
 from workspace import (
     add_watch_item,
@@ -335,6 +336,120 @@ def test_mark_seen_revoked_during_comparison_rolls_back(tmp_path: Path) -> None:
     with connect_workspace(tmp_path, "demo") as conn:
         item = get_watch_item(conn, "600001.SH")
         assert item["ack_run_id"] == first and item["revision"] == seen["revision"]
+
+
+def test_pause_resume_preserves_notes_facts_and_ack(tmp_path: Path) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    saved = save_watch(
+        actor,
+        "600001.SH",
+        first,
+        {
+            "status": "research",
+            "reason": "合成理由",
+            "next_check": "合成下一步",
+            "note_url": "https://example.com/research",
+        },
+        0,
+        tmp_path,
+        "demo",
+    )
+    baseline = mark_seen(actor, "600001.SH", first, saved["revision"], tmp_path, "demo")
+    import_snapshot(tmp_path, FIXTURES_DIR / "peer_second_change.json", "demo")
+    assert get_home(actor, tmp_path, "demo")["needs_review_count"] == 1
+    board = get_peer_discover(actor, "600001.SH", tmp_path, "demo")["results"]
+    protected = (
+        "reason",
+        "next_check",
+        "note_url",
+        "added_run_id",
+        "ack_run_id",
+        "ack_at",
+        "anchor_code",
+    )
+    previous = baseline
+    for status, count in (("paused", 0), ("observe", 1)):
+        set_watch_status(
+            actor,
+            "600001.SH",
+            status,
+            previous["revision"],
+            previous["updated_at"],
+            tmp_path,
+            "demo",
+        )
+        with connect_workspace(tmp_path, "demo") as conn:
+            current = get_watch_item(conn, "600001.SH")
+            assert conn.execute("SELECT count(*) FROM update_jobs").fetchone()[0] == 0
+        assert current["status"] == status
+        assert current["revision"] == previous["revision"] + 1
+        assert all(current[key] == baseline[key] for key in protected)
+        home = get_home(actor, tmp_path, "demo")
+        assert home["needs_review_count"] == count and home["total_watch_count"] == 1
+        assert home["watch_items"][0]["has_change"]  # Pause hides reminders, not facts.
+        assert get_peer_discover(actor, "600001.SH", tmp_path, "demo")["results"] == board
+        with pytest.raises(ServiceError, match="记录已变化"):
+            set_watch_status(
+                actor,
+                "600001.SH",
+                status,
+                previous["revision"],
+                previous["updated_at"],
+                tmp_path,
+                "demo",
+            )
+        previous = current
+    with pytest.raises(ServiceError, match="仅支持"):
+        set_watch_status(
+            actor,
+            "600001.SH",
+            "invalid",
+            previous["revision"],
+            previous["updated_at"],
+            tmp_path,
+            "demo",
+        )
+
+
+def test_pause_rejects_deleted_and_readded_record(tmp_path: Path) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    old = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    delete_watch(actor, "600001.SH", old["revision"], old["updated_at"], tmp_path, "demo")
+    new = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    assert new["revision"] == old["revision"]
+    with pytest.raises(ServiceError, match="记录已变化"):
+        set_watch_status(
+            actor, "600001.SH", "paused", old["revision"], old["updated_at"], tmp_path, "demo"
+        )
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert get_watch_item(conn, "600001.SH")["status"] == "observe"
+
+
+@pytest.mark.parametrize("revoke_at", [1, 2, 3])
+def test_pause_authorization_and_rollback(tmp_path: Path, revoke_at: int) -> None:
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    actor = create_demo_actor()
+    first = import_snapshot(tmp_path, FIXTURES_DIR / "peer_complete_v1.json", "demo")
+    old = save_watch(actor, "600001.SH", first, {}, 0, tmp_path, "demo")
+    calls = 0
+
+    def expire(a):
+        nonlocal calls
+        calls += 1
+        if calls == revoke_at:
+            a.revoke()
+        return check_actor(a)
+
+    with patch("services.check_actor", side_effect=expire), pytest.raises(AuthError):
+        set_watch_status(
+            actor, "600001.SH", "paused", old["revision"], old["updated_at"], tmp_path, "demo"
+        )
+    with connect_workspace(tmp_path, "demo") as conn:
+        assert get_watch_item(conn, "600001.SH") == old
 
 
 def test_auth_boundaries() -> None:

@@ -349,6 +349,55 @@ def test_empty_home_entry_expires_with_page(tmp_path, monkeypatch, invalidate):
     asyncio.run(check())
 
 
+def test_home_pause_fold_resume_and_stale_callback(tmp_path, monkeypatch):
+    from services import save_watch
+
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+    first = import_snapshot(
+        tmp_path, Path(__file__).parent / "tests/fixtures/peer_complete_v1.json", "demo"
+    )
+    save_watch(
+        app.create_demo_actor(), "600001.SH", first, {"reason": "合成笔记"}, 0, tmp_path, "demo"
+    )
+
+    async def check():
+        page = AppMockPage()
+        await app.build_app()(page)
+
+        def controls():
+            return list(app_controls(page.controls[0]))
+
+        def button(label):
+            return next(c for c in controls() if isinstance(c, ft.Button) and c.content == label)
+
+        pause = button("暂停关注")
+        await pause.on_click(SimpleNamespace(control=pause))
+        assert any("需要复看：0 家" in str(c.value) for c in controls() if isinstance(c, ft.Text))
+        folded = next(
+            c
+            for c in controls()
+            if isinstance(c, ft.Column) and c.controls and isinstance(c.controls[0], ft.Card)
+        )
+        assert not folded.visible
+        toggle = button("显示已暂停 (1)")
+        await toggle.on_click(None)
+        assert folded.visible
+        resume = button("恢复为观察")
+        await resume.on_click(SimpleNamespace(control=resume))
+        assert any("需要复看：1 家" in str(c.value) for c in controls() if isinstance(c, ft.Text))
+        pause.disabled = False
+        await pause.on_click(SimpleNamespace(control=pause))  # Detached event must not re-pause.
+        with connect_workspace(tmp_path, "demo") as conn:
+            item = get_watch_item(conn, "600001.SH")
+            assert item["status"] == "observe" and item["reason"] == "合成笔记"
+            assert item["ack_run_id"] is None
+        await page.on_close(None)
+
+    asyncio.run(check())
+
+
 def test_home_cards_show_each_company_date(tmp_path, monkeypatch):
     initialize(tmp_path, "demo", journal_mode="DELETE")
     monkeypatch.setattr(app, "APP_MODE", "demo")

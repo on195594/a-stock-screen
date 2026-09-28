@@ -512,7 +512,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                 else:
                     change_summary = "本工具覆盖的字段暂无未阅变化"
 
-            if has_change:
+            if has_change and it["status"] != "paused":
                 needs_review_count += 1
 
             overview_items.append(
@@ -524,6 +524,7 @@ def get_home(actor: Actor, state_dir: Path, mode: Mode) -> dict[str, Any]:
                     "has_change": has_change,
                     "change_summary": change_summary,
                     "revision": it["revision"],
+                    "updated_at": it["updated_at"],
                     "valuation_date": item_date,
                     "fact_summary": (
                         f"PB {fmt_number(usable_row.get('pb'))} 倍 · "
@@ -925,6 +926,39 @@ def mark_seen(
             raise
     except WorkspaceError as exc:
         raise ServiceError(str(exc)) from exc
+    finally:
+        conn.close()
+
+
+def set_watch_status(
+    actor: Actor,
+    code: str,
+    status: str,
+    expected_revision: int,
+    expected_updated_at: str,
+    state_dir: Path,
+    mode: Mode,
+) -> None:
+    """Pause or resume personal attention without touching notes, facts or acknowledgement."""
+    check_actor(actor)
+    if status not in ("observe", "paused"):
+        raise ServiceError("快捷操作仅支持暂停或恢复为观察")
+    conn = connect_workspace(state_dir, mode)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        check_actor(actor)
+        changed = conn.execute(
+            """UPDATE watch_items SET status=?, revision=revision+1, updated_at=?
+            WHERE code=? AND revision=? AND updated_at=?""",
+            (status, utc_now(), code, expected_revision, expected_updated_at),
+        )
+        if changed.rowcount != 1:
+            raise ServiceError("记录已变化或已删除后重新加入，请刷新后重试")
+        check_actor(actor)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
