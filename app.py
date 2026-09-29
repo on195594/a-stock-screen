@@ -204,7 +204,13 @@ def build_app():
             await render_current_view()
             if gen == page_state["generation"] and page_state["connected"]:
                 page.update()
-                await page.scroll_to(offset=restore_offset, duration=0)
+                try:
+                    await asyncio.wait_for(
+                        page.scroll_to(offset=restore_offset, duration=0),
+                        timeout=1.0,
+                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).debug("Scroll restore skipped: %s", exc)
 
         async def on_route_change(e):
             if e.route != page_state["route"]:

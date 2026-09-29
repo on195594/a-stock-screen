@@ -1941,3 +1941,32 @@ def test_read_failure_has_safe_retry_without_submitting(tmp_path, monkeypatch):
         await page.on_close(None)
 
     asyncio.run(check())
+
+
+def test_navigation_survives_scroll_to_timeout(tmp_path, monkeypatch):
+    initialize(tmp_path, "demo", journal_mode="DELETE")
+    monkeypatch.setattr(app, "APP_MODE", "demo")
+    monkeypatch.setattr(app, "STATE_DIR", tmp_path)
+
+    async def check():
+        page = AppMockPage()
+
+        async def failing_scroll_to(*, offset, duration):
+            raise RuntimeError(
+                "TimeoutException after 0:00:10.000000: Timeout waiting for invoke method listener for View(3).scroll_to"
+            )
+
+        page.scroll_to = failing_scroll_to
+        await app.build_app()(page)
+        # Navigating via navigation bar (the exact production trigger) must survive scroll_to failure
+        nav_bar = page.navigation_bar
+        nav_bar.selected_index = 1
+        await nav_bar.on_change(SimpleNamespace(control=nav_bar))
+        assert page.route.startswith("/discover")
+        # Navigating via route change must also survive scroll_to failure
+        await page.on_route_change(SimpleNamespace(route="/settings"))
+        texts = [c.value for c in app_controls(page.controls[0]) if isinstance(c, ft.Text)]
+        assert any("账户与运行信息" in text for text in texts)
+        await page.on_close(None)
+
+    asyncio.run(check())
